@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-from torchtext.vocab import build_vocab_from_iterator
-from torchtext.data.utils import get_tokenizer
 from transformers import BertTokenizer, BertModel
 from sklearn.feature_extraction.text import TfidfVectorizer
 
