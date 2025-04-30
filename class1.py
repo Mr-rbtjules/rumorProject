@@ -10,9 +10,9 @@ class UserScorer(nn.Module):
         output_dim : 1 pour un score par utilisateur
         """
         super().__init__()
-        # 1) couche pour calculer la représentation compacte ỹ_i = tanh(W_u y_i + b_u)
+        # 1) couche pour calculer la représentation compacte ỹ_i = tanh(W_u*y_i + b_u)
         self.fc_user = nn.Linear(input_dim, hidden_dim)
-        # 2) couche pour produire le score s_i = σ(w_s^T ỹ_i + b_s)
+        # 2) couche pour produire le score s_i = σ(w_sT*ỹ_i + b_s)
         self.fc_score = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, y_i):
