@@ -4,7 +4,8 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, "./data/logs")
 MODELS_DIR = os.path.join(BASE_DIR, "./data/saved_models")
-RAW_DATA_DIR = os.path.join(BASE_DIR, "./data/lorenzData")
+RAW_DATA_DIR = os.path.join(BASE_DIR, "./data/pheme-rnr-dataset")
+CACHE_DATA_DIR = os.path.join(BASE_DIR, "./data/cache")
 FIG_DIR = os.path.join(BASE_DIR, "./data/figures")
 
 
