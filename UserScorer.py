@@ -6,7 +6,7 @@ class UserScorer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim=1):
         """
         input_dim  : dimension de y_i (features concaténées)
-        hidden_dim : dimension de la représentation ỹ_i
+        hidden_dim : dimension de la représentation ỹ_i (input de la seconde couche)
         output_dim : 1 pour un score par utilisateur
         """
         super().__init__()
