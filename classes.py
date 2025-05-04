@@ -11,19 +11,17 @@ from dataBase import DataBase
 
 #format input : x=(nbre_engagement, temps entre chaque engagement,source = x_u ,x_t=caractéristiques d'un texte)
 class CaptureModule(nn.Module):
+    # 3 layers : a linear NN, then a RNN (LSTM) and the last one also a linear NN
     def __init__(self, input_size, embedding_size, hidden_size):
         super(CaptureModule, self).__init__()
         self.embedding = nn.Linear(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True)  # utilisation d'un RNN LSTM
+        self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True) 
         self.fc = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x):
         x = torch.tanh(self.embedding(x))
-        #_, (h_n, _) = self.rnn(x)  # output,(h_n,c_n)
-        #h_last = h_n.squeeze(0)  # garde que le dernier état
-        outputs, (_, _) = self.rnn(x)  # on prend les outputs et pas le dernier état caché (voir LSTM)
-        last_output = outputs[:, -1, :]  # prend le dernier output de la séquence
-        x = torch.tanh(self.fc(last_output))
+        _, (h_n, _) = self.rnn(x)  # output,(h_n,c_n)
+        x = torch.tanh(self.fc(h_n))
         return x
     
 
