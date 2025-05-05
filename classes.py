@@ -18,24 +18,12 @@ class CaptureModule(nn.Module):
         self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True) 
         self.fc = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x):
-        x = torch.tanh(self.embedding(x))
-        _, (h_n, _) = self.rnn(x)  # output,(h_n,c_n)
-        x = torch.tanh(self.fc(h_n))
-        return x
-    
+    def forward(self, x_t):  # xt = (η, ∆t, xu , xτ) are the features of the article
+        x_tt = torch.tanh(self.embedding(x_t))  # first layer : LNN
+        _, (h_n, _) = self.rnn(x_tt)  # second layer : LSTM
+        v_j = torch.tanh(self.fc(h_n))  # last layer : LNN
+        return v_j
 
-class IntegrateModule(nn.Module):
-    def __init__(self, article_representations_size, user_scores_dim=1):
-        super(IntegrateModule, self).__init__()
-        self.fc = nn.Linear(article_representations_size+user_scores_dim, 1) #output =1 car proba d'engagement
-
-    def forward(self, v_j,s_i):  # v_j = article_score, s_i = user_score
-        #concatenate article_repr et score
-        x = torch.cat((v_j, s_i), dim=1)
-        x = torch.tanh(x)
-        x = torch.sigmoid(self.fc(x))
-        return x
 
 class ScoreModule(nn.Module):
     def __init__(self, user_feature_size, hidden_size):
@@ -52,26 +40,41 @@ class ScoreModule(nn.Module):
         return scores, user_repr
 
 
+class IntegrateModule(nn.Module):
+    def __init__(self, article_representations_size, user_scores_dim=1):
+        super(IntegrateModule, self).__init__()
+        self.fc = nn.Linear(article_representations_size + user_scores_dim, 1) #output =1 car proba d'engagement
+
+    def forward(self, v_j, s_i, user_article_mask):  # v_j = article_score, s_i = user_score
+        # apply mask to scores in order to only consider the users who have interacted with the article
+        masked_scores = s_i*user_article_mask
+        sum_scores = torch.sum(masked_scores, dim=1)
+        count_users = torch.sum(user_article_mask, dim=1)
+        # Average users score for the article
+        p_j = sum_scores/count_users
+
+        c_j = torch.cat((v_j, p_j), dim=1)
+        prediction = torch.sigmoid(self.fc(c_j))
+        return prediction
+
+
 class CSI_model(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, user_feature_size):
         super(CSI_model, self).__init__()
         self.capture_module = CaptureModule(input_size, embedding_size, hidden_size)
-        self.integrate_module = IntegrateModule(hidden_size, user_feature_size)
         self.score_module = ScoreModule(user_feature_size, hidden_size)
+        self.integrate_module = IntegrateModule(hidden_size)
+        #self.integrate_module = IntegrateModule(hidden_size, user_feature_size)
 
-    def forward(self, article_features, user_features,user_article_mask):
-        article_repr = self.capture_module(article_features)
+    def forward(self, article_features, user_features, user_article_mask):
+        # article score
+        v_j = self.capture_module(article_features)
+        # user score
+        s_i, user_repr = self.score_module(user_features)
         
-        user_scores, user_repr = self.score_module(user_features)
-        #?user_scores = user_scores.unsqueeze(0)
-        masked_scores = user_scores * user_article_mask #mask = matrices de 0 et 1 -> on garde que les scores des utilisateurs concernés
-        sum_scores = torch.sum(masked_scores, dim=1)
-        count_users = torch.sum(user_article_mask, dim=1)
+        prediction = self.integrate_module(v_j, s_i, user_article_mask)
         
-        avg_user_scores = sum_scores / count_users
-        engagement_prob = self.integrate_module(article_repr, avg_user_scores)
-        
-        return engagement_prob, user_repr, article_repr
+        return prediction, user_repr, article_repr
     
 
 def loss_function(predictions, labels, Wu, lambda_reg=0.01):
