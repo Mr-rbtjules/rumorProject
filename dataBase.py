@@ -172,7 +172,7 @@ class DataBase:
                 for thread_dir in cat_dir.glob("*"):
                     if not thread_dir.is_dir():
                         continue
-                    if i>10: #just for testing
+                    if i>5000: #just for testing
                         break
                     i+=1
                     thread_id = thread_dir.name

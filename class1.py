@@ -31,6 +31,8 @@ class IntegrateModule(nn.Module):
         self.fc = nn.Linear(article_representations_size+user_scores_dim, 1) #output =1 car proba d'engagement
 
     def forward(self, v_j,s_i):
+        #changer s_i: [batch_size] -> [batch_size, 1]
+        s_i = s_i.unsqueeze(1)
         #concatenate article_repr et score
         x= torch.cat((v_j, s_i), dim=1)
         x = torch.tanh(x)
@@ -56,7 +58,7 @@ class CSI_model(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, user_feature_size):
         super(CSI_model, self).__init__()
         self.capture_module = CaptureModule(input_size, embedding_size, hidden_size)
-        self.integrate_module = IntegrateModule(hidden_size, user_feature_size)
+        self.integrate_module = IntegrateModule(hidden_size)
         self.score_module = ScoreModule(user_feature_size, hidden_size)
 
     def forward(self, article_features, user_features,user_article_mask):
@@ -124,13 +126,31 @@ class RumorDataset(Dataset):
     def __len__(self):
         return len(self.article_features)
     
-    def __getitem__(self, idx):  
-        return {
-            'article_features': self.article_features[idx],
-            'user_features': self.user_features,
-            'labels': self.labels[idx],
-            'user_article_mask': self.user_article_mask[idx]
-        }
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            indices = range(start, stop, step)
+            return RumorDataset(
+                [self.article_features[i] for i in indices],
+                self.user_features,
+                self.labels[indices],  
+                self.user_article_mask[indices]
+            )
+        
+        elif isinstance(idx, int):
+            if idx < 0:
+                idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
+            
+            return {
+                'article_features': self.article_features[idx],
+                'user_features': self.user_features,
+                'labels': self.labels[idx],
+                'user_article_mask': self.user_article_mask[idx]
+            }
+        else:
+            raise TypeError(f"Invalid index type: {type(idx)}")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data = DataBase(bin_size=1, user_svd_dim=50)
 
@@ -140,7 +160,9 @@ user_features_tensor = torch.tensor(user_features, dtype=torch.float)
 article_ids = data.article_ids()
 
 X_sequences, y_labels = create_dataset() #label dit si rumeur ou pas et X_sequ=[eta, delta_t, x_u, x_tau]
-
+# Add right after creating y_labels
+unique, counts = np.unique(y_labels.numpy(), return_counts=True)
+print(f"Class distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
 #user-article mask: 1 si user a interagi avec l'article et 0 sinon
 user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
 user_article_mask = torch.zeros(len(article_ids), len(user_ids))
@@ -149,7 +171,6 @@ for i, art_id in enumerate(article_ids):
     for user_id in thread_users:
         if user_id in user_id_to_idx:
             user_article_mask[i, user_id_to_idx[user_id]] = 1.0
-
 
 dataset = RumorDataset(
     article_features=X_sequences,
@@ -186,7 +207,7 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 
 
-num_epochs = 10
+num_epochs = 5
 best_accuracy = 0.0
 
 for epoch in range(num_epochs):
@@ -195,7 +216,6 @@ for epoch in range(num_epochs):
     model.train()
     #trainign loop
     for batch in train_loader:
-        print(batch)
         article_features = batch['article_features'].to(device)
         user_features = batch['user_features'].to(device)
         labels = batch['labels'].to(device)
@@ -229,12 +249,15 @@ for epoch in range(num_epochs):
 
             loss = loss_function(predictions, labels, Wu)
             total_loss_validation+=loss.item()
-        all_labels.extend(labels)
-        all_preds.extend(predictions.cpu().numpy())
+        all_labels.append(labels.cpu().numpy().flatten())
+        all_preds.append(predictions.cpu().numpy().flatten())
 
     total_loss_validation/=len(val_loader)
     #save best model
-    accuracy = (all_preds.round() == all_labels).float().mean()
+    all_labels = np.concatenate(all_labels)
+    all_preds = np.concatenate(all_preds)
+    print(all_labels[0:10], all_preds[0:10])
+    accuracy = np.mean((np.round(all_preds) == all_labels).astype(float))
     print(f'Accuracy: {accuracy:.4f}')
     if accuracy>best_accuracy:
         best_accuracy=accuracy
