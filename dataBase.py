@@ -1,7 +1,7 @@
 # pheme_csi_data.py
 import rumorProject as RP
 
-
+import torch
 import json, pickle, os
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -17,9 +17,22 @@ import matplotlib.pyplot as plt
 
 class DataBase:
     
-    """Notes:
-    tweet = a source tweet OR a reaction
-    thread = a source tweet AND all its reactions = article in CSI
+    """
+
+    End-to-end loader + pre-processor for the PHEME rumour dataset,
+    producing CSI-ready tensors.
+
+    ex of use:
+        data = DataBase(1, 50, save_file_name="rumor_data_jules")
+
+        user_vecs_for_capture = data.user_vecs_global
+        user_vecs_for_score = data.user_vecs_source
+        threads_seq = data.threads_seq
+
+
+        Notes:
+        tweet = a source tweet OR a reaction
+        thread = a source tweet AND all its reactions = article in CSI
     """
 
 
@@ -27,13 +40,11 @@ class DataBase:
             self, 
             bin_size: int = 1, #in hours
             dim_x_u : int = 20, #20 in CSI paper, None now to check with scree plot
-            dim_x_tau : int = None,
             dim_y_i : int = 50, #50 in CSI paper
             save_file_name: str = None
     ):
         self.bin_size = bin_size
         self.dim_x_u = dim_x_u
-        self.dim_x_tau = dim_x_tau
         self.dim_y_i = dim_y_i
         self.pheme_dataset_path = Path(RP.config.RAW_DATA_DIR)
         self.save_path = Path(RP.config.CACHE_DATA_DIR) / f"{save_file_name}.pkl"
@@ -57,10 +68,13 @@ class DataBase:
 
         else:
 
-
             print("Parse all threads")
             self._parse_all_threads()
             print("Threads parsed")
+
+            print("Precompute embeddings")
+            self._precompute_embeddings()
+            print("Embeddings precomputed")
 
             print("Build user vectors global")
             self._build_user_vectors_global()
@@ -70,18 +84,27 @@ class DataBase:
             self._build_user_vectors_source()
             print("User vectors source built")
 
-            if input("build article sequences? (y/n)") == "y":
+            
+            print("Build article sequences")
+            self._build_threads_sequences()
+            print("Article sequences built")
 
-                print("Build article sequences")
-                self._build_threads_sequences()
-                print("Article sequences built")
+            del self.tweets_df
+            gc.collect()
+            print("Free memory")
+
+            print("Save precomputed data")
+            self.save_precomputed_data()
+            print("Data saved")
 
     def _parse_all_threads(self):
-        """ need to parse all the json (each a tweet), each already grouped by
-          rumour->thread->source/or_reaction -> json. as described in build user
-          vector and build thread seq we need a dataframe with all the tweets and 
-          a dict with the source tweet of each thread.
-        """
+        """ need to parse all the json (each a tweet), each already grouped 
+        (in directories) by the structure rumour->thread->source/or_reaction -> .json
+        As described in build_user_vector_source/gloval and build_thread_seq,
+        we need a dataframe with all the tweets and a dict with the info source
+        tweet of each thread"""
+        
+        #loop on all json files
         for source_path in list(self.pheme_dataset_path.glob("*/*/*/source-tweet/*.json")):
             # ex path in pheme: event/rumours/THREAD_ID/source-tweet/THREAD_ID.json
             thread_dir = source_path.parent.parent
@@ -90,17 +113,20 @@ class DataBase:
             thread_id = f"{parent}-{root}"# create thing like ex = "rumours-552783238415265792"
             if parent == "rumours":
                 label = 1
-            else: label = 0
+            else: 
+                label = 0
 
-            #create thread dict with source_id, user_id, time, label + add source tweet to self.tweets
+            #create threads_source dict with source_id, user_id, time, label + add source tweet to self.tweets
             self.deal_with_source_tweet(thread_id, source_path, label)
             
             # parse all reactions in the thread and add them to self.tweets
             self._deal_with_reactions(thread_dir, thread_id, label)
 
-
         print(f"Parsed {len(self.tweets)} tweets")
+
+        #transform self.tweets to a dataframe for easier grouping
         self.tweets_df = pd.DataFrame(self.tweets)
+
         print("DataFrame head: ",self.tweets_df.head()) #should be thread tweet_id parent_id user_id text ts label
         print("Types: ",self.tweets_df.dtypes)
 
@@ -113,11 +139,13 @@ class DataBase:
     def _build_user_vectors_global(self):
         """ to build them we need a data frame with all the tweets, 1 by line
         each line has at least a thread id, a user id
-        To build user vector (don't care about nb of reactions only if react and in which thread) """
+        To build user vector (don't care about nb of reactions only if
+        react and in which thread """
         
         #create dict with user id as key and index as value
         user_index = {}
         thread_index  = {}
+
         #we do that to build incidence matrix each line represent a user and each column a thread
         #that's why we need to associate integer to each
         for i, u_id in enumerate(self.tweets_df.user_id.unique()): #use unique bc user might be involved in several threads
@@ -160,21 +188,22 @@ class DataBase:
         U, s, vt = svds(Incidence_matrix, k=self.dim_x_u)
         print("SVD completed")
 
-        #now we have a more compressed version of the "rows" that is a vector u[i] representing ith user associeted 
-        #to user id user_idx[i]
+        #now we have a more compressed version of the "rows" that is a vector
+        # u[i] representing ith user associeted to user id user_idx[i]
         for user_id, i in user_index.items():
             self.user_vecs_global[user_id] = U[i]
 
         return None
     
 
-    
-
     def _deal_with_reactions(self, thread_dir, thread_id, label):
-        # add all reaction to self.tweets
+        """ add all reactions to self.tweets"""
+        #parse all reactions in the thread and add them to self.tweets
+        #loop on all json files
         for rp in (thread_dir / "reactions").glob("*.json"):
             with open(rp) as f:
                 reply = json.load(f)
+
             self._add_row_to_tweets(
                 reply, 
                 thread_id, 
@@ -187,23 +216,29 @@ class DataBase:
             if reply["id_str"] == "552787794503143424":
                 print(self.tweets[-1]) #should be associated to 55...92
 
-    def _add_row_to_tweets(self, tweet, thread_id, label, tid, parent_id): 
+    def _add_row_to_tweets(self, tweet, thread_id, label, tid, parent_id):
+        """ add a row to self.tweets, if the tweet isn't already in self.tweets""" 
         if tid in self.processed_tweet_ids:
             return None
         
+        #add the id to the set to avoid duplicates
         self.processed_tweet_ids.add(tid)
+
         self.tweets.append({
             "thread_id": thread_id,
             "tweet_id": tid,
             "parent_id": parent_id,
             "user_id": tweet["user"]["id_str"],
             "text": tweet["text"],
-            "ts": RP.tools._to_ts(tweet["created_at"]),
+            "ts": RP.tools._to_ts(tweet["created_at"]),#from string to timestamp int
             "label": label
-        })    
+        })   
+
+        return None 
 
     def deal_with_source_tweet(self, thread_id, source_path, label):
-
+        """ add info of the tweet to thread_source dict and add 
+        the tweet to self.tweets"""
         with open(source_path) as f:
             src = json.load(f)
         src_user_id = src["user"]["id_str"]
@@ -223,42 +258,46 @@ class DataBase:
         if thread_id == "rumours-552783238415265792":
                 print("Thread source example: ",self.threads_source[thread_id])
                 print("Tweet source example: ",self.tweets[-1])
+
         return None
     
     
     def _build_user_vectors_source(self):
-        """Build source-level user embeddings yᵢ for the Score module in a manual, transparent style."""
+        """we build source-level user vector yi for the score module
+        based on weighted graph of common thread engament between user"""
         # 1. map users to indices
-        users_list = list(self.tweets_df.user_id.unique())
         user_index = {}
-        for i, u in enumerate(users_list):
+        for i, u in enumerate(self.tweets_df.user_id.unique()):
             user_index[u] = i
-        n_users = len(users_list)
+        n_users = len(user_index)
         print(f"{n_users} users")
 
+        #create a dict for grouping the user involved in a thread, for each thread
+        #we will use this to build the weighted graph
         thread_users = {}
         for _, row in self.tweets_df.iterrows():
             thread_id = row["thread_id"]
             user_id = row["user_id"]
-            idx = user_index[user_id]
             if thread_id not in thread_users: #if key not in dict create it
-                thread_users[thread_id] = set()
-            thread_users[thread_id].add(idx)
+                thread_users[thread_id] = set() #to avoid dupplicates
+            thread_users[thread_id].add(user_index[user_id])
 
         # build weighted graph edges=number of engagment in the same threads
-        #create a dict with key = (user1, user2) and value = number of tisame thread
+        #create a dict with key = (user1, user2) and value = number of common threads involved in
         edge_weights = {}
-        for users in thread_users.values(): #don't contain dupplicate 
-            users = sorted(users) #to avoid duplicates style (1,2) and (2,1) and stay consistent
-            for i in range(len(users)):
-                for j in range(i+1, len(users)):# to avoid duplicates also have comparaison between each users
-                    pair = (users[i], users[j])#create key
+        for users_of_the_thread in thread_users.values(): #don't contain dupplicate 
+            users_of_the_thread = sorted(users_of_the_thread) #to avoid duplicates style (1,2) and (2,1) and stay consistent
+            for i in range(len(users_of_the_thread)):
+                for j in range(i+1, len(users_of_the_thread)):# to avoid duplicates also have comparaison between each users
+                    pair = (users_of_the_thread[i], users_of_the_thread[j]) #create key
+                    #if key exist add one or create it
                     if pair in edge_weights:
                         edge_weights[pair] += 1 #involved in the same thread increase connection
                     else:
                         edge_weights[pair] = 1
 
-        # 4. build sparse adjacency matrix
+        # build sparse adjacency matrix
+        #start by building coordinate matrix
         rows = []
         cols = []
         data = []
@@ -271,6 +310,7 @@ class DataBase:
             cols.append(ui)
             data.append(weight)
 
+        #from coord matrix to csr
         Adjacency_matrix = csr_matrix(
             (data, (rows, cols)), 
             shape=(n_users, n_users)
@@ -279,7 +319,6 @@ class DataBase:
 
         print(f"SVD with k={self.dim_y_i}")
         U, s, vt = svds(Adjacency_matrix, k=self.dim_y_i)
-       
 
         for user_id, idx in user_index.items():
             self.user_vecs_source[user_id] = U[idx]
@@ -287,29 +326,60 @@ class DataBase:
     def _build_threads_sequences(self):
         """ to build them we need both a df with all the tweets grouped by thread
         and a dict with representing the source associeted to each thread (need more
-        specifically the time of the source tweet)"""
+        specifically the time of the source tweet)
+        here care about nb of reactions of a user in a thread
+        prepare data for capture module using  temporal sequence
+        of user interactions per thread"""
         
-        print("Load model")
-        self._load_model()
-        print("Model loaded")
-
-        #here care about nb of reactions of a user in a thread
-
-        """prepare data for capture module using  temporal sequence of user interactions per thread"""
 
         #container, tweets are either source or reactions and now sort by threads
         thread_groups = self.tweets_df.groupby("thread_id")
-        
-        #  threads in batches to avoid memory pblm
-        threads = list(thread_groups.groups.keys()) #thread_id: list of thread id
-        print("first thread to be processed: ", threads[0])
-        for thread_id in tqdm(threads, desc="Processing threads"):
+        thread_sizes = thread_groups.size()
+
+        print(f"Average tweets per thread: {thread_sizes.mean():.2f}")
+        print(f"Max tweets in a thread: {thread_sizes.max()}")
+
+
+        threads_id_list = list(thread_groups.groups.keys()) #thread_id: list of thread id
+        print("first thread to be processed: ", threads_id_list[0])
+        for thread_id in tqdm(threads_id_list, desc="Processing threads"):
+                
                 grp = thread_groups.get_group(thread_id)
                 self._process_single_thread(thread_id, grp)
 
-
         return None
     
+    def _precompute_embeddings(self, batch_size: int = 128):
+        """Embed every tweet text once and add the 384 dim vector
+         to the new colomn embed with tweets_df['embed']."""
+        
+        #load llm for embeding
+        self._load_model()
+        #list of all the tweet text
+        texts = self.tweets_df["text"].tolist()
+        all_vecs = [] #each elem will be an array of size batch_size with each element a vector of dim 384
+        for i in tqdm(range(0, len(texts), batch_size), desc="Encoding tweets"):
+            batch = texts[i : i + batch_size] #if i + batch_size > len(texts) doesn't go out of range
+            batch_embeded = self._model.encode(
+                    batch, convert_to_numpy=True, show_progress_bar=False
+                )
+            all_vecs.append(batch_embeded)
+
+        #flat everything to have 
+        all_vecs = np.vstack(all_vecs)
+
+        print("Shape of all_vecs: ", all_vecs.shape)#suppose to be (Nb of tweets,384)
+
+        self.tweets_df["embed"] = list(all_vecs)    # one ndarray per row
+
+        #verif
+        print("head of tweets_df: ", self.tweets_df.head())
+        print("tail of tweets_df: ", self.tweets_df.tail())
+
+        # the model is no longer needed can be removed from ram
+        del self._model
+        torch.mps.empty_cache()
+        gc.collect()
 
     def _process_single_thread(self, thread_id, grp):
 
@@ -344,8 +414,9 @@ class DataBase:
             # process text embeddings in batches, ! bin_df.text.tolist() might be empty if weird text encoding
             
             #x_tau = self._encode_texts_in_batches(bin_df.text.tolist()).mean(axis=0)
-            x_tau = self._model.encode(bin_df.text.tolist(), show_progress_bar=False).mean(axis=0)
             
+            #x_tau = self._model.encode(bin_df.text.tolist(), show_progress_bar=False).mean(axis=0)
+            x_tau = np.mean(bin_df.embed.tolist(), axis=0) #use the precomputed embedding
             
             # harvesrt user id of user present in the bin to make a mean of the user 
             #vector and have a global representation of the users in this bin
@@ -377,7 +448,8 @@ class DataBase:
         """load model in ram only when needed, will be used in _build_threads_sequences
         transform text to vector of dimension 384"""
         if self._model is None:
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
+            device = torch.device("mps")
+            self._model = SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
 
     def _load_precomputed_data(self):
@@ -386,7 +458,7 @@ class DataBase:
             d = pickle.load(f)  #load a dictionary wi
         self.threads_seq = d["threads_seq"] 
         self.labels = d["labels"]
-        self.user_vecs = d["user_vecs_global"]
+        self.user_vecs_global = d["user_vecs_global"]
         self.user_vecs_source = d["user_vecs_source"]
 
 
