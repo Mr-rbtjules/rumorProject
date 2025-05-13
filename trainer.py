@@ -64,6 +64,8 @@ class Trainer:
         self.set_train_val_dataset()
         self.train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
         self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size)
+        self.means = {}
+        self.stds = {}
 
     def set_model(self):
         input_size = self.X_sequences[0].shape[1]  # eta, delta_t, x_u, x_tau
@@ -195,24 +197,24 @@ class Trainer:
                 features.extend(item['x_u'])
                 features.extend(item['x_tau'])
                 feature_list.append(features)
-            
-            max_seq_len = 100 #On doit avoir la même taille pour tous les articles -> si trop grand, on coupe, sinon on remplit avec 0
-            if len(feature_list) > max_seq_len:
-                feature_list = feature_list[:max_seq_len]
+
+            max_seq_len = 100
+            raw = torch.tensor(feature_list, dtype=torch.float)
+            mean = raw.mean(dim=0)
+            std = raw.std(dim=0)
+            std[std < 1e-5] = 1.0
+            norm_raw = (raw - mean) / std
+            if norm_raw.size(0) > max_seq_len:
+                norm_raw = norm_raw[:max_seq_len]
             else:
-                padding = [[0] * len(feature_list[0]) for _ in range(max_seq_len - len(feature_list))]
-                feature_list.extend(padding)
-                
-            X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
+                pad_len = max_seq_len - norm_raw.size(0)
+                pad = torch.zeros(pad_len, norm_raw.size(1))
+                norm_raw = torch.cat([norm_raw, pad], dim=0)
+            X_sequences.append(norm_raw)
             y_labels.append(label)
-        for i in range(len(X_sequences)):
-            mean = torch.mean(X_sequences[i], dim=0)
-            std = torch.std(X_sequences[i], dim=0)
-            std[std < 1e-5] = 1.0  # Prevent division by zero
-            X_sequences[i] = (X_sequences[i] - mean) / std
-        
-        # print('x',X_sequences[0])
-        # print('y',y_labels[0])
+
+            self.means[art_id] = mean
+            self.stds[art_id] = std
         return X_sequences, torch.tensor(y_labels, dtype=torch.float)
 
 
