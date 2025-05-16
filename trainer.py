@@ -35,13 +35,14 @@ class Trainer:
     def __init__(self, database, device, learning_rate=0.001, batch_size=16):
         self.model = None
         self.database = database
+        self.max_seq_len = self.database.T
         self.device = device
 
         self.user_ids, self.user_features = self.database.user_feature_matrix()
         self.user_features_tensor = torch.tensor(self.user_features, dtype=torch.float)
         self.article_ids = self.database.article_ids()
         #anciennemnet X_sequences, y_labels = create_dataset() #label dit si rumeur ou pas et X_sequ=[eta, delta_t, x_u, x_tau]
-        self.X_sequences, self.y_labels = self.create_X_y()
+        self.X_sequences, self.lengths, self.y_labels = self.create_X_y()
         
         self.user_article_mask = self.create_user_article_mask()
 
@@ -49,6 +50,7 @@ class Trainer:
         
 
         self.dataset = RP.RumorDataset(
+            lengths=self.lengths,
             article_features=self.X_sequences,
             user_features=self.user_features_tensor,
             labels=self.y_labels,
@@ -98,22 +100,24 @@ class Trainer:
             self.model.train()
             #trainign loop
             for batch in self.train_loader:
-                #print(batch)
                 article_features = batch['article_features'].to(self.device)
                 user_features = batch['user_features'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 mask = batch['user_article_mask'].to(self.device)
-                
+                lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
+
                 self.optimizer.zero_grad()
-                
-                predictions, user_repr, article_repr = self.model(article_features, user_features, mask)
+
+                predictions, user_repr, article_repr = self.model(
+                    article_features, lengths, user_features, mask
+                )
 
                 Wu = self.model.score_module.user_fc.weight
 
                 loss = self.loss_function(predictions, labels, Wu)
                 loss.backward()
                 self.optimizer.step()
-                total_loss_training+=loss.item()
+                total_loss_training += loss.item()
             #validation loop
             self.model.eval()
             all_labels = []
@@ -123,13 +127,16 @@ class Trainer:
                 user_features = batch['user_features'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 mask = batch['user_article_mask'].to(self.device)
-                
+                lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
+
                 with torch.no_grad():
-                    predictions, user_repr, article_repr = self.model(article_features, user_features, mask)
+                    predictions, user_repr, article_repr = self.model(
+                        article_features, lengths, user_features, mask
+                    )
                     Wu = self.model.score_module.user_fc.weight
                     loss = self.loss_function(predictions, labels, Wu)
                     total_loss_validation += loss.item()
-                
+
                 # Convert to numpy arrays for consistent processing
                 all_labels.append(labels.cpu().numpy())
                 all_preds.append(predictions.cpu().numpy())
@@ -165,7 +172,7 @@ class Trainer:
         self.train_dataset, self.val_dataset = random_split(
             self.dataset,
             [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)  # For reproducibility
+            generator=torch.Generator().manual_seed(RP.config.SEED_RAND)  # For reproducibility
         )
 
         return None
@@ -185,11 +192,13 @@ class Trainer:
         #pour convertir les données en tensor
         article_ids = self.database.article_ids()
         X_sequences = []
+        lengths = []
         y_labels = []
         
         for art_id in article_ids:
             seq, label = self.database.article_sequence(art_id)
-            
+            size_raw = len(seq)
+            lengths.append(size_raw)
             feature_list = []
             for item in seq:
                 # Format: [eta, delta_t, x_u, x_tau]
@@ -198,25 +207,23 @@ class Trainer:
                 features.extend(item['x_tau'])
                 feature_list.append(features)
 
-            max_seq_len = 100
+            #normalization ? to device ?
             raw = torch.tensor(feature_list, dtype=torch.float)
-            mean = raw.mean(dim=0)
-            std = raw.std(dim=0)
-            std[std < 1e-5] = 1.0
-            norm_raw = (raw - mean) / std
-            if norm_raw.size(0) > max_seq_len:
-                norm_raw = norm_raw[:max_seq_len]
-            else:
-                pad_len = max_seq_len - norm_raw.size(0)
-                pad = torch.zeros(pad_len, norm_raw.size(1))
-                norm_raw = torch.cat([norm_raw, pad], dim=0)
-            X_sequences.append(norm_raw)
+                    # pad (or truncate) to exactly 27 timesteps
+            if raw.size(0) < self.max_seq_len:
+            # pad with zeros at the end
+                pad = torch.zeros((self.max_seq_len - size_raw, raw.size(1)),
+                              device=raw.device)
+                raw = torch.cat([raw, pad], dim=0)
+            X_sequences.append(raw)
             y_labels.append(label)
 
-            self.means[art_id] = mean
-            self.stds[art_id] = std
-        return X_sequences, torch.tensor(y_labels, dtype=torch.float)
 
+            
+        X = torch.stack(X_sequences)
+        L = torch.tensor(lengths, dtype=torch.long)
+        Y = torch.tensor(y_labels, dtype=torch.long)
+        return X, L, Y
 
 
     def loss_function(self, predictions, labels, Wu, lambda_reg=0.01):

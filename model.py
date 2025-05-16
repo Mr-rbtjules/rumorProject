@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence
+
 
 #format input : x=(nbre_engagement, temps entre chaque engagement,source = x_u ,x_t=caractéristiques d'un texte)
 class CaptureModule(nn.Module):
@@ -10,9 +12,13 @@ class CaptureModule(nn.Module):
         self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x_t):  # xt = (η, ∆t, xu , xτ) are the features of the article
+    def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
         x_tt = torch.tanh(self.embedding(x_t))  # first layer : LNN
-        _, (h_n, _) = self.rnn(x_tt)  # second layer : LSTM
+        packed = pack_padded_sequence(x_tt,
+                                      lengths.cpu(),
+                                      batch_first=True,
+                                      enforce_sorted=False)
+        _, (h_n, _) = self.rnn(packed)  # second layer : LSTM
         #print('shape',h_n.shape)
         h_n = h_n.squeeze(0)  # remove the first dimension (batch_size, hidden_size)
         #print('after',h_n.shape)
@@ -63,10 +69,10 @@ class CSI_model(nn.Module):
         self.integrate_module = IntegrateModule(hidden_size)
         #self.integrate_module = IntegrateModule(hidden_size, user_feature_size)
 
-    def forward(self, article_features, user_features, user_article_mask):
+    def forward(self, article_features, lengths, user_features, user_article_mask):
         # article score
-        v_j = self.capture_module(article_features)
-        article_repr=v_j
+        v_j = self.capture_module(article_features, lengths)
+        article_repr = v_j
         # user score
 
         s_i, user_repr = self.score_module(user_features)

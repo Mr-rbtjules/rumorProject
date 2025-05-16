@@ -12,4 +12,4 @@ FIG_DIR = os.path.join(BASE_DIR, "./data/figures")
 SEED_NP = 4
 SEED_RAND = 5
 SEED_SHUFFLE = 6
-SEED_TORCH = 7
+SEED_TORCH = 42

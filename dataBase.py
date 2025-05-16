@@ -55,6 +55,7 @@ class DataBase:
         self.tweets_df = None
         self.threads_source = {} #dict with key = thread_id and value = dict with source_id, user_id, time, label
         self.threads_seq = {} #dict with key = thread_id and value = list of dict with x_u, x_tau, delta_t, eta as keys
+        self.T = None #max sequence length for training
         self.labels = {} #dict with key = thread_id and value = label (0 or 1 for rumor or non-rumor)
         #user vector for capture using threads incidence matrix
         self.user_vecs_global = {} #dict with key = user_id and value = vector of the user,
@@ -66,6 +67,7 @@ class DataBase:
             print("Loading precomputed data")
             self._load_precomputed_data()
             print("Data loaded")
+
 
             print("Parse all threads")
             self._parse_all_threads()
@@ -353,6 +355,10 @@ class DataBase:
                 grp = thread_groups.get_group(thread_id)
                 self._process_single_thread(thread_id, grp)
 
+        self.T = max([len(seq) for seq in self.threads_seq.values()])
+        print("Max sequence length: ", self.T)
+
+
         return None
     
     def _precompute_embeddings(self, batch_size: int = 128):
@@ -455,6 +461,7 @@ class DataBase:
         transform text to vector of dimension 384"""
         if self._model is None:
             device = torch.device("mps")
+            #verifier pretained
             self._model = SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
 
@@ -466,6 +473,9 @@ class DataBase:
         self.labels = d["labels"]
         self.user_vecs_global = d["user_vecs_global"]
         self.user_vecs_source = d["user_vecs_source"]
+
+        self.T = max([len(seq) for seq in self.threads_seq.values()])
+        print("Max sequence length: ", self.T)
 
 
     def save_precomputed_data(self):
@@ -493,8 +503,8 @@ class DataBase:
 
     def user_feature_matrix(self):
         """Return (list[user_id], np.ndarray[num_users, user_k])"""
-        ids = list(self.user_vecs_global.keys())
-        mat = np.vstack([self.user_vecs_global[u] for u in ids])
+        ids = list(self.user_vecs_source.keys())
+        mat = np.vstack([self.user_vecs_source[u] for u in ids])
         return ids, mat
 
 
@@ -502,12 +512,12 @@ class DataBase:
 
 
 class RumorDataset(Dataset):
-    def __init__(self, article_features, user_features, labels, user_article_mask):
+    def __init__(self, lengths, article_features, user_features, labels, user_article_mask):
         self.article_features = article_features
         self.user_features = user_features
         self.labels = labels
         self.user_article_mask = user_article_mask
-        
+        self.lengths = lengths
     def __len__(self):
         return len(self.article_features)
     
@@ -516,5 +526,7 @@ class RumorDataset(Dataset):
             'article_features': self.article_features[idx],
             'user_features': self.user_features,
             'labels': self.labels[idx],
-            'user_article_mask': self.user_article_mask[idx]
+            'user_article_mask': self.user_article_mask[idx],
+            'lengths': self.lengths[idx]    
         }
+    
