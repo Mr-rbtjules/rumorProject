@@ -13,6 +13,7 @@ from tqdm.auto import tqdm # for progress bar
 from sentence_transformers import SentenceTransformer
 from scipy.sparse import csr_matrix, save_npz
 from scipy.sparse.linalg import svds
+from sklearn.random_projection import GaussianRandomProjection
 import gc  # for garbage collection
 import matplotlib.pyplot as plt
 
@@ -42,14 +43,18 @@ class DataBase:
             bin_size: int = 1, #in hours
             dim_x_u : int = 20, #20 in CSI paper, None now to check with scree plot
             dim_y_i : int = 50, #50 in CSI paper
+            dim_x_tau: int = 100,
             save_file_name: str = None
     ):
         self.bin_size = bin_size
         self.dim_x_u = dim_x_u
         self.dim_y_i = dim_y_i
+        self.dim_x_tau = dim_x_tau
         self.pheme_dataset_path = Path(RP.config.RAW_DATA_DIR)
         self.save_path = Path(RP.config.CACHE_DATA_DIR) / f"{save_file_name}.pkl"
         self._model = None # SentenceTransformer model
+        # random‑projection matrix for text‑embedding compression (created lazily)
+        self._rp_matrix = None
         self.tweets = []
         self.processed_tweet_ids = set()
         self.tweets_df = None
@@ -62,6 +67,11 @@ class DataBase:
         #user vector for score using weighted user graph
         self.user_vecs_source = {} #dict with key = user_id and value = vector of the user
 
+        self.initilize_data()
+        
+
+
+    def initilize_data(self):
         if self.save_path.exists():
 
             print("Loading precomputed data")
@@ -102,7 +112,7 @@ class DataBase:
 
 
             print("Save precomputed data")
-            #self.save_precomputed_data()
+            self.save_precomputed_data()
             print("Data saved")
 
     def _parse_all_threads(self):
@@ -382,7 +392,16 @@ class DataBase:
 
         print("Shape of all_vecs: ", all_vecs.shape)#suppose to be (Nb of tweets,384)
 
-        self.tweets_df["embed"] = list(all_vecs)    # one ndarray per row
+        
+        #from dim 384 to dim 100 using random projection (preserve pair wise distances)
+        grp = GaussianRandomProjection(
+            n_components=self.dim_x_tau,   # 100
+            random_state=RP.config.SEED_NP
+        )
+        reduced_vecs = grp.fit_transform(all_vecs)
+
+        print("Shape of reduced_vecs: ", reduced_vecs.shape)
+        self.tweets_df["embed"] = list(reduced_vecs)    # one ndarray per row
 
         #verif
         print("head of tweets_df: ", self.tweets_df.head())
@@ -512,11 +531,11 @@ class DataBase:
 
 
 class RumorDataset(Dataset):
-    def __init__(self, lengths, article_features, user_features, labels, user_article_mask):
+    def __init__(self, lengths, article_features, user_features, labels, user_article_mask, device):
         self.article_features = article_features
         self.user_features = user_features
         self.labels = labels
-        self.user_article_mask = user_article_mask
+        self.user_article_mask = user_article_mask.to(device)
         self.lengths = lengths
     def __len__(self):
         return len(self.article_features)
@@ -524,7 +543,7 @@ class RumorDataset(Dataset):
     def __getitem__(self, idx):  
         return {
             'article_features': self.article_features[idx],
-            'user_features': self.user_features,
+            #'user_features': self.user_features, because it's the same for all
             'labels': self.labels[idx],
             'user_article_mask': self.user_article_mask[idx],
             'lengths': self.lengths[idx]    
