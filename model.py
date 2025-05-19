@@ -9,17 +9,17 @@ class CaptureModule(nn.Module):
     def __init__(self, dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j):
         super(CaptureModule, self).__init__()
         self.embedding_wa = nn.Linear(dim_x_t, dim_embedding_wa)
-        self.dropout_wa = nn.Dropout(p=0.3)
+        self.dropout_wa = nn.Dropout(p=0.2)
         self.rnn = nn.LSTM(dim_embedding_wa, dim_hidden, batch_first=True)
         self.fc_wr = nn.Linear(dim_hidden, dim_v_j) 
-        self.dropout_wr = nn.Dropout(p=0.3)
+        self.dropout_wr = nn.Dropout(p=0.2)
 
     def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
         x_tt = torch.tanh(self.embedding_wa(x_t))  # first layer : NN
         x_tt = self.dropout_wa(x_tt)
         packed = pack_padded_sequence(
             x_tt,
-            lengths.cpu(),
+            lengths.cpu().long(),
             batch_first=True, #to keep (batch_size, seq_len, features) format
             enforce_sorted=False #
         ) 
@@ -27,8 +27,8 @@ class CaptureModule(nn.Module):
         #print('shape',h_n.shape)
         h_T = h_T.squeeze(0)  # remove the first dimension (1,batch_size, hidden_size) ->(batch_size, hidden_size)
         h_T = self.dropout_wr(h_T)
-        #print('after',h_n.shape)
-        v_j = torch.tanh(self.fc_wr(h_T))  # last layer : LNN
+        #print('after',h_n.shape)v_j = torch.tanh(self.fc_wr(h_T))
+        v_j = torch.tanh(self.fc_wr(h_T))  # removed tanh for identity
         return v_j
 
 
@@ -65,8 +65,7 @@ class IntegrateModule(nn.Module):
         #because user_article mask is boolean, we can use it to mask the scores
         #put 0 where the mask is False (~user_article_mask = where the mask is False)
         sum_scores   = torch.sum(s_i.masked_fill(~m_j, 0.0),dim=1)
-        count_users = torch.sum(m_j, dim=1)
-        count_users = torch.clamp(count_users, min=1.0)
+        count_users = torch.sum(m_j, dim=1).float().clamp_(min=1.0)
         p_j = (sum_scores / count_users).unsqueeze(1)
         c_j = torch.cat((v_j, p_j), dim=1)
         prediction = torch.sigmoid(self.fc(c_j))

@@ -365,8 +365,12 @@ class DataBase:
                 grp = thread_groups.get_group(thread_id)
                 self._process_single_thread(thread_id, grp)
 
-        self.T = max([len(seq) for seq in self.threads_seq.values()])
+        lengths = [len(seq) for seq in self.threads_seq.values()]
+        self.T = max(lengths)
         print("Max sequence length: ", self.T)
+        print("Min sequence length: ", min(lengths))
+        print("Mean sequence length: ", np.mean(lengths))
+        print("Std sequence length: ", np.std(lengths))
 
 
         return None
@@ -493,8 +497,16 @@ class DataBase:
         self.user_vecs_global = d["user_vecs_global"]
         self.user_vecs_source = d["user_vecs_source"]
 
-        self.T = max([len(seq) for seq in self.threads_seq.values()])
+
+        lengths = [len(seq) for seq in self.threads_seq.values()]
+        self.T = max(lengths)
         print("Max sequence length: ", self.T)
+        print("Min sequence length: ", min(lengths))
+        print("Mean sequence length: ", np.mean(lengths))
+        print("Std sequence length: ", np.std(lengths))
+        #RP.tools.plot_sequence_length_distribution(lengths)
+        
+        
 
 
     def save_precomputed_data(self):

@@ -1,10 +1,12 @@
 import torch
 import torch.optim as optim
+import torch.utils.tensorboard
 import rumorProject as RP
 from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 from sklearn.model_selection import StratifiedShuffleSplit
 import numpy as np
 import gc
+from pathlib import Path
 
 
 class Trainer:
@@ -42,16 +44,18 @@ class Trainer:
             threshold=0.5,
             dim_hidden=50,
             dim_v_j=100,
-            lambda_reg=0.01
+            lambda_reg=0.01,
+            reg_all=False
     ):
         self.model = None
         self.database = database
-        self.max_seq_len = self.database.T
+        self.max_seq_len = 20 #self.database.T
         self.device = device
         self.threshold = threshold
         self.dim_hidden = dim_hidden
         self.dim_v_j = dim_v_j
         self.lambda_reg = lambda_reg
+        self.reg_all = reg_all
 
         self.user_ids, self.user_features = self.database.user_feature_matrix()
         # trainer.py  __init__
@@ -95,10 +99,11 @@ class Trainer:
         self.set_model()
         self.optimizer = optim.Adam(
             self.model.parameters(), 
-            lr=learning_rate,
-            weight_decay=0.0005
+            lr=learning_rate
         )
-
+        log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / "modeltest1"
+        log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
+        self.writer = torch.utils.tensorboard.SummaryWriter(log_dir=str(log_dir))
 
 
         self.train_dataset = None
@@ -121,9 +126,9 @@ class Trainer:
         print(f"Training label distribution: {{'neg': {train_counts[0].item()}, 'pos': {train_counts[1].item()}}}")
         val_counts = torch.bincount(self.balanced_labels[self.val_dataset.indices])
         print(f"Validation label distribution: {{'neg': {val_counts[0].item()}, 'pos': {val_counts[1].item()}}}")
-    
-
+        
     def standardize_data(self):
+        print("Standardizing data...")
         # Get only training indices from the original features
         train_indices = [self.dataset.indices[i] for i in self.train_dataset.indices]
         
@@ -140,27 +145,28 @@ class Trainer:
         flat[:, 0] = torch.log1p(flat[:, 0])
         flat[:, 1] = torch.log1p(flat[:, 1])
         
-        # Compute means and stds from training data only
-        self.means = flat.mean(dim=0)
-        self.stds = flat.std(dim=0).clamp_min(1e-6)
+        # Compute means and stds ONLY for scalar features (first two columns)
+        # Store separate statistics for each feature block
+        self.scalar_means = flat[:, :2].mean(dim=0)
+        self.scalar_stds = flat[:, :2].std(dim=0).clamp_min(1e-6)
         
         # Now standardize ALL data using train-derived stats
         self.X_sequences = torch.stack([self._standardise_seq(seq) for seq in self.X_sequences])
         
         # Update the datasets with standardized features
         self.dataset.dataset.article_features = self.X_sequences
-
-
-        
-
-        # now we have the means and stds for each feature (all eta normalised toegether , all delta_t normalised together, ...)
-
-
-
+        print("Standardization complete.")
     def _standardise_seq(self, seq):
-            seq = seq.clone()
-            return (seq - self.means) / self.stds
-
+        seq = seq.clone()
+        # Apply log1p to eta and delta_t features
+        seq[:, 0] = torch.log1p(seq[:, 0])
+        seq[:, 1] = torch.log1p(seq[:, 1])
+        
+        # Only standardize the first two features (scalars)
+        seq[:, :2] = (seq[:, :2] - self.scalar_means) / self.scalar_stds
+        
+        # Leave embedding features unchanged
+        return seq
     def set_model(self):
 
         #capture
@@ -227,7 +233,7 @@ class Trainer:
                 #user_features = batch['user_features'].to(self.device)
                 user_features = self.user_features_tensor #why not in model directly ?
                 labels = batch['labels'].to(self.device)
-                mask = batch['user_article_mask']
+                mask = batch['user_article_mask'].to(self.device)
                 lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
 
                 self.optimizer.zero_grad()
@@ -258,7 +264,7 @@ class Trainer:
                 #user_features = batch['user_features'].to(self.device)
                 user_features = self.user_features_tensor #why not in model directly ?
 
-                labels = batch['labels'].to(self.device)
+                labels = batch['labels'].to(self.device).float()
                 mask = batch['user_article_mask'].to(self.device)
                 lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
 
@@ -266,7 +272,7 @@ class Trainer:
                     predictions, user_repr, article_repr = self.model(
                         article_features, lengths, user_features, mask
                     )
-                    Wu = self.model.score_module.user_fc.weight
+                    Wu = self.model.get_wu()
                     loss = self.loss_function(predictions, labels, Wu)
                     total_loss_validation += loss.item()
 
@@ -304,6 +310,8 @@ class Trainer:
             # Add this to see if predictions are changing
             print(f"Raw prediction stats - Min: {np.min(all_preds):.4f}, Max: {np.max(all_preds):.4f}, Mean: {np.mean(all_preds):.4f}")
             print(f'Epoch {epoch+1}/{num_epochs}, Training Loss: {total_loss_training:.4f}, Validation Loss: {total_loss_validation:.4f}')
+            self.writer.add_scalar('Loss/Train', total_loss_training, epoch)
+            self.writer.add_scalar('Loss/validation', total_loss_validation, epoch)
                 
 
 
@@ -364,10 +372,15 @@ class Trainer:
             #normalization ? to device ?
             raw = torch.tensor(feature_list, dtype=torch.float)
                     # pad (or truncate) to exactly 27 timesteps
-            if raw.size(0) < self.max_seq_len:
-            # pad with zeros at the end
-                pad = torch.zeros((self.max_seq_len - size_raw, raw.size(1)),
-                              device=raw.device)
+            max_len = self.max_seq_len  # New fixed maximum length
+            if raw.size(0) > max_len:
+                # Truncate to first 10 timesteps
+                raw = raw[:max_len]
+                # Update the stored length if we truncated
+                lengths[-1] = max_len
+            elif raw.size(0) < max_len:
+                # Pad with zeros at the end
+                pad = torch.zeros((max_len - raw.size(0), raw.size(1)), device=raw.device)
                 raw = torch.cat([raw, pad], dim=0)
             X_sequences.append(raw)
             y_labels.append(label)
@@ -380,9 +393,32 @@ class Trainer:
         return X, L, Y
 
 
-
+    """
     def loss_function(self, predictions, labels, Wu, eps=1e-7):
         p = predictions.clamp(eps, 1. - eps)          # avoid 0 or 1
         l_acc = -(labels * p.log() + (1 - labels) * (1 - p).log()).mean()
-        l_reg = self.lambda_reg * Wu.norm(p=2).pow(2) / 2  # same regulariser
-        return l_acc + l_reg
+        if self.reg_all:
+                l_reg = 0
+                for param in self.model.parameters():
+                    l_reg += self.lambda_reg * param.norm(p=2).pow(2) / 2
+                
+        else:
+            l_reg = self.lambda_reg * Wu.norm(p=2).pow(2) / 2  # same regulariser
+        
+        return l_acc + l_reg"""
+    
+    def loss_function(self, predictions, labels, Wu, eps=1e-7):
+        # Binary cross-entropy loss
+
+        p = predictions.clamp(eps, 1. - eps)
+        labels = labels.float()
+
+        bce_loss = torch.nn.functional.binary_cross_entropy(
+            p, labels, reduction='mean'
+        )
+        
+        # L2 regularization on Wu
+        l2_reg = 0.5 * self.lambda_reg * torch.norm(Wu, p=2) ** 2
+        
+        # Total loss
+        return bce_loss + l2_reg
