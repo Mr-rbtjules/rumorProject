@@ -6,7 +6,9 @@ import numpy as np
 import argparse
 from torch.utils.data import random_split, DataLoader, Dataset
 import config
-from dataBase import DataBase
+from dataBase1 import DataBase
+import platform
+import torch
 
 
 #format input : x=(nbre_engagement, temps entre chaque engagement,source = x_u ,x_t=caractéristiques d'un texte)
@@ -15,12 +17,15 @@ class CaptureModule(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size):
         super(CaptureModule, self).__init__()
         self.embedding = nn.Linear(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True) 
+        self.rnn = nn.LSTM(embedding_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x_t):  # xt = (η, ∆t, xu , xτ) are the features of the article
         x_tt = torch.tanh(self.embedding(x_t))  # first layer : LNN
         _, (h_n, _) = self.rnn(x_tt)  # second layer : LSTM
+        #print('shape',h_n.shape)
+        h_n = h_n.squeeze(0)  # remove the first dimension (batch_size, hidden_size)
+        #print('after',h_n.shape)
         v_j = torch.tanh(self.fc(h_n))  # last layer : LNN
         return v_j
 
@@ -43,21 +48,23 @@ class ScoreModule(nn.Module):
 class IntegrateModule(nn.Module):
     def __init__(self, article_representations_size, user_scores_dim=1):
         super(IntegrateModule, self).__init__()
-        self.fc = nn.Linear(article_representations_size + user_scores_dim, 1) #output =1 car proba d'engagement
-
-    def forward(self, v_j, s_i, user_article_mask):  # v_j = article_score, s_i = user_score
-        # apply mask to scores in order to only consider the users who have interacted with the article
-        masked_scores = s_i*user_article_mask
+        self.fc = nn.Linear(article_representations_size + user_scores_dim, 1)
+    
+    def forward(self, v_j, s_i, user_article_mask):
+        # user_article_mask is already the correct mask for this batch's articles
+        # No need to index it further
+        batch_mask = user_article_mask
+        
+        # Rest of the code remains the same
+        masked_scores = s_i * batch_mask
         sum_scores = torch.sum(masked_scores, dim=1)
-        count_users = torch.sum(user_article_mask, dim=1)
-        # Average users score for the article
-        p_j = sum_scores/count_users
-
+        count_users = torch.sum(batch_mask, dim=1)
+        count_users = torch.clamp(count_users, min=1.0)
+        p_j = (sum_scores / count_users).unsqueeze(1)
         c_j = torch.cat((v_j, p_j), dim=1)
         prediction = torch.sigmoid(self.fc(c_j))
         return prediction
-
-
+    
 class CSI_model(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, user_feature_size):
         super(CSI_model, self).__init__()
@@ -69,15 +76,22 @@ class CSI_model(nn.Module):
     def forward(self, article_features, user_features, user_article_mask):
         # article score
         v_j = self.capture_module(article_features)
+        article_repr=v_j
         # user score
+
         s_i, user_repr = self.score_module(user_features)
-        
+        s_i = s_i.squeeze(-1)
         prediction = self.integrate_module(v_j, s_i, user_article_mask)
-        
+        prediction = prediction.squeeze(-1)
+
         return prediction, user_repr, article_repr
     
 
 def loss_function(predictions, labels, Wu, lambda_reg=0.01):
+    #eps avoid log0
+    epsilon = 1e-7
+    predictions = torch.clamp(predictions, epsilon, 1-epsilon)
+    
     L_accuracy = -torch.mean(labels * torch.log(predictions) + 
                       (1 - labels) * torch.log(1 - predictions))
     
@@ -92,6 +106,14 @@ def create_dataset():
     X_sequences = []
     y_labels = []
     
+
+    #find the max length of the sequences
+    max_seq_len = 0
+    for art_id in article_ids:
+        seq, label = data.article_sequence(art_id)
+
+        max_seq_len = max(max_seq_len, len(seq[0]['x_tau']))
+    print('max_seq_len', max_seq_len)
     for art_id in article_ids:
         seq, label = data.article_sequence(art_id)
         
@@ -101,20 +123,17 @@ def create_dataset():
             features = [item['eta'], item['delta_t']]
             features.extend(item['x_u'])
             features.extend(item['x_tau'])
+            #padding of x_tau
+            features.extend([0] * (max_seq_len - len(item['x_tau'])))
             feature_list.append(features)
-        
-        max_seq_len = 100 #On doit avoir la même taille pour tous les articles -> si trop grand, on coupe, sinon on remplit avec 0
-        if len(feature_list) > max_seq_len:
-            feature_list = feature_list[:max_seq_len]
-        else:
-            padding = [[0] * len(feature_list[0]) for _ in range(max_seq_len - len(feature_list))]
-            feature_list.extend(padding)
+
             
         X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
         y_labels.append(label)
     print('x',X_sequences[0])
     print('y',y_labels[0])
     return X_sequences, torch.tensor(y_labels, dtype=torch.float)
+
 
 class RumorDataset(Dataset):
     def __init__(self, article_features, user_features, labels, user_article_mask):
@@ -133,7 +152,21 @@ class RumorDataset(Dataset):
             'labels': self.labels[idx],
             'user_article_mask': self.user_article_mask[idx]
         }
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def get_device():
+    system = platform.system().lower()
+    if system == "darwin":
+        # macOS (Apple Silicon)
+        return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    elif system == "windows" or system == "linux":
+        # Windows or Ubuntu
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        return torch.device("cpu")
+
+device = get_device()
+print(f"Using device: {device}")
 data = DataBase(bin_size=1, user_svd_dim=50)
 
 
@@ -163,15 +196,19 @@ dataset = RumorDataset(
 
 input_size = X_sequences[0].shape[1]  # eta, delta_t, x_u, x_tau
 embedding_size = 100
-hidden_size = 128
+hidden_size = 100
 user_feature_size = user_features_tensor.shape[1]
 
 train_size = int(0.8 * len(dataset))
-train_dataset = dataset[:train_size]
-val_dataset = dataset[train_size:]
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(
+    dataset,
+    [train_size, val_size],
+    generator=torch.Generator().manual_seed(42)  # For reproducibility
+)
 
-print (len(train_dataset), len(val_dataset))
-batch_size = 2
+
+batch_size = 16
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
@@ -188,8 +225,15 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 
 
-num_epochs = 10
+num_epochs = 20
 best_accuracy = 0.0
+print("\n=== DATASET STATS ===")
+print(f"Total dataset size: {len(dataset)}")
+print(f"Training set size: {len(train_dataset)}")
+print(f"Validation set size: {len(val_dataset)}")
+print(f"User features shape: {user_features_tensor.shape}")
+print(f"User-article mask shape: {user_article_mask.shape}")
+print(f"Non-zero entries in mask: {user_article_mask.sum().item()}")
 
 for epoch in range(num_epochs):
     total_loss_training=0
@@ -197,7 +241,7 @@ for epoch in range(num_epochs):
     model.train()
     #trainign loop
     for batch in train_loader:
-        print(batch)
+        #print(batch)
         article_features = batch['article_features'].to(device)
         user_features = batch['user_features'].to(device)
         labels = batch['labels'].to(device)
@@ -214,10 +258,9 @@ for epoch in range(num_epochs):
         optimizer.step()
         total_loss_training+=loss.item()
     #validation loop
-    total_loss_training/=len(train_loader)
     model.eval()
-    all_labels=[]
-    all_preds=[]
+    all_labels = []
+    all_preds = []
     for batch in val_loader:
         article_features = batch['article_features'].to(device)
         user_features = batch['user_features'].to(device)
@@ -226,18 +269,31 @@ for epoch in range(num_epochs):
         
         with torch.no_grad():
             predictions, user_repr, article_repr = model(article_features, user_features, mask)
-
             Wu = model.score_module.user_fc.weight
-
             loss = loss_function(predictions, labels, Wu)
-            total_loss_validation+=loss.item()
-        all_labels.extend(labels)
-        all_preds.extend(predictions.cpu().numpy())
+            total_loss_validation += loss.item()
+        
+        # Convert to numpy arrays for consistent processing
+        all_labels.append(labels.cpu().numpy())
+        all_preds.append(predictions.cpu().numpy())
 
-    total_loss_validation/=len(val_loader)
-    #save best model
-    accuracy = (all_preds.round() == all_labels).float().mean()
+    total_loss_validation /= len(val_loader)
+
+    # Convert to numpy arrays for metrics calculation
+    all_labels = np.concatenate(all_labels)
+    all_preds = np.concatenate(all_preds)
+    print(all_labels[:3],all_preds[:3])
+
+    print(all_preds.shape)
+    predictions_binary = np.round(all_preds)
+    accuracy = np.mean((predictions_binary == all_labels).astype(float))
     print(f'Accuracy: {accuracy:.4f}')
+    # At the end of validation
+    unique_preds, counts = np.unique(predictions_binary, return_counts=True)
+    print(f"Prediction distribution: {dict(zip(unique_preds.astype(int), counts))}")
+
+    # Add this to see if predictions are changing
+    print(f"Raw prediction stats - Min: {np.min(all_preds):.4f}, Max: {np.max(all_preds):.4f}, Mean: {np.mean(all_preds):.4f}")
     if accuracy>best_accuracy:
         best_accuracy=accuracy
         torch.save(model.state_dict(), 'best_model.pth')
