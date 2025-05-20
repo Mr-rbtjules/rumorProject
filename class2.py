@@ -113,7 +113,7 @@ def create_dataset():
             features.extend(item['x_u'])
             features.extend(item['x_tau'])
             feature_list.append(features)
-        
+        #fa ut trouver la variabe de taille max puis padding
         max_seq_len = 100 #On doit avoir la même taille pour tous les articles -> si trop grand, on coupe, sinon on remplit avec 0
         if len(feature_list) > max_seq_len:
             feature_list = feature_list[:max_seq_len]
