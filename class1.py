@@ -92,6 +92,14 @@ def create_dataset():
     X_sequences = []
     y_labels = []
     
+
+    #find the max length of the sequences
+    max_seq_len = 0
+    for art_id in article_ids:
+        seq, label = data.article_sequence(art_id)
+
+        max_seq_len = max(max_seq_len, len(seq[0]['x_tau']))
+    print('max_seq_len', max_seq_len)
     for art_id in article_ids:
         seq, label = data.article_sequence(art_id)
         
@@ -102,13 +110,11 @@ def create_dataset():
             features.extend(item['x_u'])
             features.extend(item['x_tau'])
             feature_list.append(features)
-        
-        max_seq_len = 100 #On doit avoir la même taille pour tous les articles -> si trop grand, on coupe, sinon on remplit avec 0
-        if len(feature_list) > max_seq_len:
-            feature_list = feature_list[:max_seq_len]
-        else:
-            padding = [[0] * len(feature_list[0]) for _ in range(max_seq_len - len(feature_list))]
-            feature_list.extend(padding)
+        # find the max length of the sequences
+
+
+        padding = [[0] * len(feature_list['x_tau']) for _ in range(max_seq_len - len(feature_list['x_tau']))]
+        feature_list.extend(padding)
             
         X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
         y_labels.append(label)
@@ -160,6 +166,9 @@ user_features_tensor = torch.tensor(user_features, dtype=torch.float)
 article_ids = data.article_ids()
 
 X_sequences, y_labels = create_dataset() #label dit si rumeur ou pas et X_sequ=[eta, delta_t, x_u, x_tau]
+# print les eta de tous les x_squequences
+for i in range(len(X_sequences)):
+    print(f"Article {article_ids[i]}: {X_sequences[i][:, 0]}")  # Affiche les eta de chaque article
 # Add right after creating y_labels
 unique, counts = np.unique(y_labels.numpy(), return_counts=True)
 print(f"Class distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
