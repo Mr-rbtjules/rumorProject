@@ -6,9 +6,7 @@ import numpy as np
 import argparse
 from torch.utils.data import random_split, DataLoader, Dataset
 import config
-from dataBase1 import DataBase
-import platform
-import torch
+from dataBase import DataBase
 
 
 #format input : x=(nbre_engagement, temps entre chaque engagement,source = x_u ,x_t=caractéristiques d'un texte)
@@ -65,6 +63,7 @@ class IntegrateModule(nn.Module):
         prediction = torch.sigmoid(self.fc(c_j))
         return prediction
     
+
 class CSI_model(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, user_feature_size):
         super(CSI_model, self).__init__()
@@ -106,32 +105,49 @@ def create_dataset():
     X_sequences = []
     y_labels = []
     
-
-    #find the max length of the sequences
-    max_seq_len = 0
+    # First find max sequence length across all articles
+    max_seq_len_tau = 0  # For x_tau features
     for art_id in article_ids:
-        seq, label = data.article_sequence(art_id)
-
-        max_seq_len = max(max_seq_len, len(seq[0]['x_tau']))
-    print('max_seq_len', max_seq_len)
+        seq, _ = data.article_sequence(art_id)
+        for item in seq:
+            max_seq_len_tau = max(max_seq_len_tau, len(item['x_tau']))
+    print('max x_tau length:', max_seq_len_tau)
+    
+    # Now find the maximum number of engagements per article
+    max_engagements = 0
+    for art_id in article_ids:
+        seq, _ = data.article_sequence(art_id)
+        max_engagements = max(max_engagements, len(seq))
+    print('max engagements per article:', max_engagements)
+    
+    # Now create padded sequences
     for art_id in article_ids:
         seq, label = data.article_sequence(art_id)
         
+        # Create feature list with proper padding for each engagement
         feature_list = []
         for item in seq:
             # Format: [eta, delta_t, x_u, x_tau]
             features = [item['eta'], item['delta_t']]
             features.extend(item['x_u'])
-            features.extend(item['x_tau'])
-            #padding of x_tau
-            features.extend([0] * (max_seq_len - len(item['x_tau'])))
+            
+            # Add x_tau with padding
+            padded_x_tau = list(item['x_tau'])
+            padded_x_tau.extend([0] * (max_seq_len_tau - len(item['x_tau'])))
+            features.extend(padded_x_tau)
+            
             feature_list.append(features)
-
+        
+        # Pad sequences with zeros to ensure all have same number of engagements
+        feature_dim = len(feature_list[0]) if feature_list else 2 + len(seq[0]['x_u']) + max_seq_len_tau
+        while len(feature_list) < max_engagements:
+            feature_list.append([0] * feature_dim)
             
         X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
         y_labels.append(label)
-    print('x',X_sequences[0])
-    print('y',y_labels[0])
+    
+    print('Feature shape of first article:', X_sequences[0].shape)
+    print('Label of first article:', y_labels[0])
     return X_sequences, torch.tensor(y_labels, dtype=torch.float)
 
 
@@ -208,7 +224,7 @@ train_dataset, val_dataset = random_split(
 )
 
 
-batch_size = 16
+batch_size = 2
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
