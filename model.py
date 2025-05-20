@@ -9,13 +9,20 @@ class CaptureModule(nn.Module):
     def __init__(self, dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j):
         super(CaptureModule, self).__init__()
         self.embedding_wa = nn.Linear(dim_x_t, dim_embedding_wa)
-        self.dropout_wa = nn.Dropout(p=0.2)
+        self.dropout_wa = nn.Dropout(p=0.5) # Increased dropout
         self.rnn = nn.LSTM(dim_embedding_wa, dim_hidden, batch_first=True)
         self.fc_wr = nn.Linear(dim_hidden, dim_v_j) 
-        self.dropout_wr = nn.Dropout(p=0.2)
+        self.dropout_wr = nn.Dropout(p=0.5) # Increased dropout
 
     def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
-        x_tt = torch.tanh(self.embedding_wa(x_t))  # first layer : NN
+        batch_size, seq_len = x_t.shape[0], x_t.shape[1]
+        x_tt = torch.zeros(batch_size, seq_len, self.embedding_wa.out_features, 
+                    device=x_t.device)
+    
+    # Process only valid timesteps for each sequence in the batch
+        for i in range(batch_size):
+            x_tt[i, :lengths[i]] = torch.tanh(self.embedding_wa(x_t[i, :lengths[i]]))
+        
         x_tt = self.dropout_wa(x_tt)
         packed = pack_padded_sequence(
             x_tt,
@@ -33,9 +40,9 @@ class CaptureModule(nn.Module):
 
 
 class ScoreModule(nn.Module):
-    def __init__(self, dim_x_t, dim_embedding_wu):
+    def __init__(self, dim_y_i, dim_embedding_wu):
         super(ScoreModule, self).__init__()
-        self.user_fc = nn.Linear(dim_x_t, dim_embedding_wu) #to get dim_y_it = dim_embedding_wu
+        self.user_fc = nn.Linear(dim_y_i, dim_embedding_wu) #to get dim_y_it = dim_embedding_wu
         self.score_fc = nn.Linear(dim_embedding_wu, 1) # to get dim_s_i = 1
         
     def forward(self, y_i):
@@ -102,4 +109,3 @@ class CSI_model(nn.Module):
     
     def get_wu(self):
         return self.score_module.get_wu()
-   

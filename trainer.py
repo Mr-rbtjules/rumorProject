@@ -101,6 +101,14 @@ class Trainer:
             self.model.parameters(), 
             lr=learning_rate
         )
+        # Add learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='min', 
+            factor=0.1, 
+            patience=8 # Reduce LR after 8 epochs without validation loss improvement (matching early stopping patience)
+        )
+
         log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / "modeltest1"
         log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
         self.writer = torch.utils.tensorboard.SummaryWriter(log_dir=str(log_dir))
@@ -146,26 +154,28 @@ class Trainer:
         flat[:, 1] = torch.log1p(flat[:, 1])
         
         # Compute means and stds ONLY for scalar features (first two columns)
-        # Store separate statistics for each feature block
+        # These features are already log-transformed in DataBase.py
         self.scalar_means = flat[:, :2].mean(dim=0)
         self.scalar_stds = flat[:, :2].std(dim=0).clamp_min(1e-6)
         
         # Now standardize ALL data using train-derived stats
-        self.X_sequences = torch.stack([self._standardise_seq(seq) for seq in self.X_sequences])
+        # The log transformation is now done in DataBase.py
+        self.X_sequences = torch.stack([
+            self._standardise_seq(seq, length) 
+            for seq, length in zip(self.X_sequences, self.lengths)
+        ])
         
         # Update the datasets with standardized features
         self.dataset.dataset.article_features = self.X_sequences
         print("Standardization complete.")
-    def _standardise_seq(self, seq):
+    def _standardise_seq(self, seq, length=None):
         seq = seq.clone()
-        # Apply log1p to eta and delta_t features
-        seq[:, 0] = torch.log1p(seq[:, 0])
-        seq[:, 1] = torch.log1p(seq[:, 1])
-        
-        # Only standardize the first two features (scalars)
-        seq[:, :2] = (seq[:, :2] - self.scalar_means) / self.scalar_stds
-        
-        # Leave embedding features unchanged
+        # If length not provided, standardize the whole sequence
+        if length is None:
+            seq[:, :2] = (seq[:, :2] - self.scalar_means) / self.scalar_stds
+        else:
+            # Only standardize up to the actual length
+            seq[:length, :2] = (seq[:length, :2] - self.scalar_means) / self.scalar_stds
         return seq
     def set_model(self):
 
@@ -210,7 +220,7 @@ class Trainer:
         
     def train(self, num_epochs=20):
 
-        patience = 5
+        patience = 8 # Increased patience to allow scheduler to trigger
         best_val_loss = float('inf')
         epochs_no_improve = 0
 
@@ -281,6 +291,9 @@ class Trainer:
                 all_preds.append(predictions.cpu().numpy())
 
             total_loss_validation /= len(self.val_loader)
+
+            # Step the learning rate scheduler
+            self.scheduler.step(total_loss_validation)
 
             if total_loss_validation < best_val_loss - 1e-4:
                 best_val_loss = total_loss_validation
@@ -417,8 +430,14 @@ class Trainer:
             p, labels, reduction='mean'
         )
         
-        # L2 regularization on Wu
-        l2_reg = 0.5 * self.lambda_reg * torch.norm(Wu, p=2) ** 2
+        # L2 regularization
+        l2_reg = 0
+        if self.reg_all:
+            for param in self.model.parameters():
+                l2_reg += 0.5 * self.lambda_reg * torch.norm(param, p=2) ** 2
+        else:
+            # Original L2 regularization on Wu
+            l2_reg = 0.5 * self.lambda_reg * torch.norm(Wu, p=2) ** 2
         
         # Total loss
         return bce_loss + l2_reg

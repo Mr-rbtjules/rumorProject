@@ -1,5 +1,6 @@
 # pheme_csi_data.py
 import rumorProject as RP
+import datetime as dt
 
 import torch
 from torch.utils.data import Dataset
@@ -162,7 +163,12 @@ class DataBase:
         
         #create dict with user id as key and index as value
         user_index = {}
-        thread_index  = {}
+        thread_index = {}
+
+        # Ensure tweets_df is valid before processing
+        if self.tweets_df is None or 'user_id' not in self.tweets_df.columns or 'thread_id' not in self.tweets_df.columns:
+            print("Error: tweets_df is not valid for building user vectors global.")
+            return None # Or raise an error, depending on desired behavior
 
         #we do that to build incidence matrix each line represent a user and each column a thread
         #that's why we need to associate integer to each
@@ -248,11 +254,17 @@ class DataBase:
             "parent_id": parent_id,
             "user_id": tweet["user"]["id_str"],
             "text": tweet["text"],
-            "ts": RP.tools._to_ts(tweet["created_at"]),#from string to timestamp int
+            "ts": self._to_ts(tweet["created_at"]),#from string to timestamp int
             "label": label
         })   
 
         return None 
+    
+    def _to_ts(self, tstr):
+        """ "Wed Jan 07 11:06:08 +0000 2015" to 1420628768"""
+        fmt = "%a %b %d %H:%M:%S %z %Y"
+        return int(dt.datetime.strptime(tstr, fmt).timestamp())
+
 
     def deal_with_source_tweet(self, thread_id, source_path, label):
         """ add info of the tweet to thread_source dict and add 
@@ -560,4 +572,3 @@ class RumorDataset(Dataset):
             'user_article_mask': self.user_article_mask[idx],
             'lengths': self.lengths[idx]    
         }
-    
