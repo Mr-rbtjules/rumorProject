@@ -181,7 +181,7 @@ class Trainer:
 
         #capture
         dim_x_t = self.X_sequences[0].shape[1] # eta, delta_t, x_u, x_tau
-        dim_embedding_wa = 100
+        dim_embedding_wa = 100 #dim x_tt
         dim_hidden = self.dim_hidden #dimension of h_t and c_t
 
         dim_v_j = self.dim_v_j
