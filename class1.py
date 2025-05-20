@@ -109,12 +109,10 @@ def create_dataset():
             features = [item['eta'], item['delta_t']]
             features.extend(item['x_u'])
             features.extend(item['x_tau'])
+            #padding of x_tau
+            features.extend([0] * (max_seq_len - len(item['x_tau'])))
             feature_list.append(features)
-        # find the max length of the sequences
 
-
-        padding = [[0] * len(feature_list['x_tau']) for _ in range(max_seq_len - len(feature_list['x_tau']))]
-        feature_list.extend(padding)
             
         X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
         y_labels.append(label)

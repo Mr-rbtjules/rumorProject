@@ -96,13 +96,20 @@ def loss_function(predictions, labels, Wu, lambda_reg=0.01):
     
     return L_accuracy + L_regularization
 
-
 def create_dataset():
     #pour convertir les données en tensor
     article_ids = data.article_ids()
     X_sequences = []
     y_labels = []
     
+
+    #find the max length of the sequences
+    max_seq_len = 0
+    for art_id in article_ids:
+        seq, label = data.article_sequence(art_id)
+
+        max_seq_len = max(max_seq_len, len(seq[0]['x_tau']))
+    print('max_seq_len', max_seq_len)
     for art_id in article_ids:
         seq, label = data.article_sequence(art_id)
         
@@ -112,27 +119,16 @@ def create_dataset():
             features = [item['eta'], item['delta_t']]
             features.extend(item['x_u'])
             features.extend(item['x_tau'])
+            #padding of x_tau
+            features.extend([0] * (max_seq_len - len(item['x_tau'])))
             feature_list.append(features)
-        #fa ut trouver la variabe de taille max puis padding
-        max_seq_len = 100 #On doit avoir la même taille pour tous les articles -> si trop grand, on coupe, sinon on remplit avec 0
-        if len(feature_list) > max_seq_len:
-            feature_list = feature_list[:max_seq_len]
-        else:
-            padding = [[0] * len(feature_list[0]) for _ in range(max_seq_len - len(feature_list))]
-            feature_list.extend(padding)
+
             
         X_sequences.append(torch.tensor(feature_list, dtype=torch.float))
         y_labels.append(label)
-    for i in range(len(X_sequences)):
-        mean = torch.mean(X_sequences[i], dim=0)
-        std = torch.std(X_sequences[i], dim=0)
-        std[std < 1e-5] = 1.0  # Prevent division by zero
-        X_sequences[i] = (X_sequences[i] - mean) / std
-    
-    # print('x',X_sequences[0])
-    # print('y',y_labels[0])
+    print('x',X_sequences[0])
+    print('y',y_labels[0])
     return X_sequences, torch.tensor(y_labels, dtype=torch.float)
-
 class RumorDataset(Dataset):
     def __init__(self, article_features, user_features, labels, user_article_mask):
         self.article_features = article_features
