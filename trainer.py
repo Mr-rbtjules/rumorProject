@@ -40,7 +40,7 @@ class Trainer:
             database,
             device, 
             learning_rate=0.001, 
-            batch_size=32, 
+            batch_size=64, 
             threshold=0.5,
             dim_hidden=50,
             dim_v_j=100,

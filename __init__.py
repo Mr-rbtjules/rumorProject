@@ -2,7 +2,7 @@ from . import tools
 from . import config
 
 
-
+from .dataBaseWeibo import WeiboDataBase
 from .dataBase import DataBase, RumorDataset
 
 from .trainer import Trainer

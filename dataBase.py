@@ -45,7 +45,8 @@ class DataBase:
             dim_x_u : int = 20, #20 in CSI paper, None now to check with scree plot
             dim_y_i : int = 50, #50 in CSI paper
             dim_x_tau: int = 100,
-            save_file_name: str = None
+            save_file_name: str = None,
+            device: torch.device = None
     ):
         self.bin_size = bin_size
         self.dim_x_u = dim_x_u
@@ -67,7 +68,7 @@ class DataBase:
         self.user_vecs_global = {} #dict with key = user_id and value = vector of the user,
         #user vector for score using weighted user graph
         self.user_vecs_source = {} #dict with key = user_id and value = vector of the user
-
+        self.device = device
         self.initilize_data()
         
 
@@ -497,6 +498,7 @@ class DataBase:
         if self._model is None:
             device = torch.device("mps")
             #verifier pretained
+            #self._model = SentenceTransformer("all-mpnet-base-v2").to(device)
             self._model = SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
 
@@ -529,7 +531,7 @@ class DataBase:
                     "threads_seq": self.threads_seq,
                     "labels": self.labels,
                     "user_vecs_global": self.user_vecs_global,
-                    "user_vecs_source": self.user_vecs_source
+                    "user_vecs_source": self.user_vecs_source #dictionnaire cle = user_id, value = vector
                 },
                 file=f
             )
