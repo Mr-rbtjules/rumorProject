@@ -9,32 +9,37 @@ class CaptureModule(nn.Module):
     def __init__(self, dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j):
         super(CaptureModule, self).__init__()
         self.embedding_wa = nn.Linear(dim_x_t, dim_embedding_wa)
-        self.dropout_wa = nn.Dropout(p=0.5) # Increased dropout
+        self.ln1 = nn.LayerNorm(dim_embedding_wa)  # Replace BatchNorm with LayerNorm
+        self.dropout_wa = nn.Dropout(p=0.2)
         self.rnn = nn.LSTM(dim_embedding_wa, dim_hidden, batch_first=True)
-        self.fc_wr = nn.Linear(dim_hidden, dim_v_j) 
-        self.dropout_wr = nn.Dropout(p=0.5) # Increased dropout
+        self.ln2 = nn.LayerNorm(dim_hidden)  # Replace BatchNorm with LayerNorm
+        self.fc_wr = nn.Linear(dim_hidden, dim_v_j)
+        self.dropout_wr = nn.Dropout(p=0.2)
 
     def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
-        batch_size, seq_len = x_t.shape[0], x_t.shape[1]
-        x_tt = torch.zeros(batch_size, seq_len, self.embedding_wa.out_features, 
-                    device=x_t.device)
+        batch_size, seq_len, feat_dim = x_t.size()
     
-    # Process only valid timesteps for each sequence in the batch
-        for i in range(batch_size):
-            x_tt[i, :lengths[i]] = torch.tanh(self.embedding_wa(x_t[i, :lengths[i]]))
-        
+        #process everything in the batch
+        flat = x_t.view(-1, feat_dim) # the batch aren't sperated in different dimension, they just follow each other
+        emb_flat = self.embedding_wa(flat) 
+        emb_flat = self.ln1(emb_flat)
+        emb_flat = torch.tanh(emb_flat)
+        x_tt = emb_flat.view(batch_size, seq_len, -1)        # (batch, seq_len, dim_emb)
         x_tt = self.dropout_wa(x_tt)
+        #tell the LSTM that the sequence might be padded
         packed = pack_padded_sequence(
             x_tt,
             lengths.cpu().long(),
             batch_first=True, #to keep (batch_size, seq_len, features) format
             enforce_sorted=False #
         ) 
-        _, (h_T, _) = self.rnn(packed)  # second layer : LSTM #est  ce qu'on est sur que h_n bien le dernier état caché?
-        #print('shape',h_n.shape)
+        #the packed will give only the non-padded part of the sequence
+        _, (h_T, _) = self.rnn(packed)  # second layer : LSTM #est  ce qu'on est sur que h_n bien le dernier état caché? oui
         h_T = h_T.squeeze(0)  # remove the first dimension (1,batch_size, hidden_size) ->(batch_size, hidden_size)
+        
+        # Apply LayerNorm before final linear layer
+        h_T = self.ln2(h_T)
         h_T = self.dropout_wr(h_T)
-        #print('after',h_n.shape)v_j = torch.tanh(self.fc_wr(h_T))
         v_j = torch.tanh(self.fc_wr(h_T))  # removed tanh for identity
         return v_j
 
@@ -42,16 +47,19 @@ class CaptureModule(nn.Module):
 class ScoreModule(nn.Module):
     def __init__(self, dim_y_i, dim_embedding_wu):
         super(ScoreModule, self).__init__()
-        self.user_fc = nn.Linear(dim_y_i, dim_embedding_wu) #to get dim_y_it = dim_embedding_wu
-        self.score_fc = nn.Linear(dim_embedding_wu, 1) # to get dim_s_i = 1
+        #register buffer move with the model and not trained and saved with the model
+        self.user_fc = nn.Linear(dim_y_i, dim_embedding_wu)
+        self.ln = nn.LayerNorm(dim_embedding_wu)  # Replace BatchNorm with LayerNorm
+        self.score_fc = nn.Linear(dim_embedding_wu, 1)
         
-    def forward(self, y_i):
-
-        y_i_t = torch.tanh(self.user_fc(y_i)) # ỹ_i = tanh(W_u*y_i + b_u)
-        
-        s_i = torch.sigmoid(self.score_fc(y_i_t)) # s_i = σ(w_sT*ỹ_i + b_s)
-        
-        return s_i, y_i_t
+        # we put y_is instead of y_i bc element in the batch is composed
+        #  of multiple y_i  corresponding to the engaged users
+    def forward(self, y_is): 
+        h = self.user_fc(y_is)
+        h = self.ln(h)  # Apply LayerNorm
+        y_i_ts = torch.tanh(h)
+        s_is = torch.sigmoid(self.score_fc(y_i_ts))
+        return s_is, y_i_ts
     
     def get_wu(self):
         return self.user_fc.weight
@@ -62,21 +70,12 @@ class IntegrateModule(nn.Module):
         super(IntegrateModule, self).__init__()
         self.fc = nn.Linear(dim_v_j + user_scores_dim, 1)
     
-    def forward(self, v_j, s_i, m_j):
-        # user_article_mask is already the correct mask for this batch's articles
-        # No need to index it further
-        
-        # Rest of the code remains the same
-        #masked_scores = s_i * batch_mask
-        #sum_scores = torch.sum(masked_scores, dim=1)
-        #because user_article mask is boolean, we can use it to mask the scores
-        #put 0 where the mask is False (~user_article_mask = where the mask is False)
-        sum_scores   = torch.sum(s_i.masked_fill(~m_j, 0.0),dim=1)
-        count_users = torch.sum(m_j, dim=1).float().clamp_(min=1.0)
-        p_j = (sum_scores / count_users).unsqueeze(1)
+    def forward(self, v_j, p_j):
+        # Compute per-article average user score over the engaged subset
+    
         c_j = torch.cat((v_j, p_j), dim=1)
-        prediction = torch.sigmoid(self.fc(c_j))
-        return prediction
+        return torch.sigmoid(self.fc(c_j))
+
 
 class CSI_model(nn.Module):
     def __init__(
@@ -92,20 +91,19 @@ class CSI_model(nn.Module):
         self.capture_module = CaptureModule(dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j)
         self.score_module = ScoreModule(dim_y_i, dim_embedding_wu)
         self.integrate_module = IntegrateModule(dim_v_j)
-        #self.integrate_module = IntegrateModule(hidden_size, user_feature_size)
 
-    def forward(self, x_t, lengths, y_i, m_j):
+    #y_is and s_is instead of y_i and s_i because for all enguaged users (no mask)
+    def forward(self, x_t, lengths, y_is):
         # article score
         v_j = self.capture_module(x_t, lengths)
-        
-       
 
-        s_i, y_i_t = self.score_module(y_i)
-        s_i = s_i.squeeze(-1)
-        prediction = self.integrate_module(v_j, s_i, m_j)
+        s_is, y_i_ts = self.score_module(y_is) 
+        p_j = s_is.mean()  # Average over the engaged users
+
+        prediction = self.integrate_module(v_j, p_j)
         prediction = prediction.squeeze(-1)
 
-        return prediction, y_i_t, v_j
+        return prediction, y_i_ts, v_j
     
     def get_wu(self):
         return self.score_module.get_wu()

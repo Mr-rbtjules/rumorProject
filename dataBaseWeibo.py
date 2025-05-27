@@ -20,7 +20,6 @@ Usage
 >>> data = WeiboDataBase(bin_size=1, dim_x_u=20, dim_y_i=50, dim_x_tau=100)
 >>> X_seq, label = data.article_sequence('1')   # example
 """
-import math, random
 import rumorProject as RP
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -51,6 +50,7 @@ class WeiboDataBase:
             dim_y_i : int = 50,
             dim_x_tau: int = 100,
             event_fraction: float = 0.2,
+            max_seq_len: int = 100,
             save_df_file_name: str = None,
             save_precomputed_file_name: str = None,
             device: torch.device = None
@@ -60,7 +60,9 @@ class WeiboDataBase:
         self.dim_y_i    = dim_y_i
         self.dim_x_tau  = dim_x_tau
         self.event_fraction = event_fraction
+        self.frac = event_fraction
         self.save_df_file_name = save_df_file_name
+        self.max_seq_len = max_seq_len
         self.save_precomputed_file_name = save_precomputed_file_name
 
         df_base = save_df_file_name if save_df_file_name else "weibo_df"
@@ -70,37 +72,21 @@ class WeiboDataBase:
 
         # placeholders
         self.tweets_df = None
-        self.events = None
         self.threads_source   = {}
         self.threads_seq      = {}
         self.labels           = {}
         self.user_vecs_global = {}
         self.user_vecs_source = {}
+        self.user_article_mask = None
+        self.article_user_idxs = None
         self.T                = 0
         self.device = device
         random.seed(RP.config.SEED_RAND)
 
-        self.initilize_data()
+        self.initialize_data()
 
-    def initilize_data(self):
+    def initialize_data(self):
         # DataFrame + events cache
-        if self.save_df_path.exists():
-            print("Loading cached DataFrame")
-            with open(self.save_df_path, "rb") as f:
-                self.tweets_df, self.events = pickle.load(f)
-            print("Cached DataFrame loaded")
-            print(f"DataFrame shape: {self.tweets_df.shape}, events: {len(self.events)}")
-        else:
-            print("Parse all threads")
-            self.tweets_df, self.events = self._parse_all_threads(event_fraction=self.event_fraction)
-            print("Caching parsed DataFrame")
-            print(f"DataFrame parsed: {self.tweets_df.shape}, events: {len(self.events)}")
-            with open(self.save_df_path, "wb") as f:
-                pickle.dump((self.tweets_df, self.events), f)
-
-        # After extracting threads_source, make events equivalent
-        self._extract_thread_sources()
-        self.events = self.threads_source
 
         if self.precomputed_data_path.exists():
             print("Loading precomputed data")
@@ -110,38 +96,122 @@ class WeiboDataBase:
             self.labels            = d["labels"]
             self.user_vecs_global  = d["user_vecs_global"]
             self.user_vecs_source  = d["user_vecs_source"]
+            self.user_article_mask = d["user_article_mask"]
+            self.threads_source    = d["threads_source"]
             self.T = max(len(seq) for seq in self.threads_seq.values())
             print("Data loaded")
             print(f"Precomputed cache: {len(self.threads_seq)} threads; "
                   f"global vectors for {len(self.user_vecs_global)} users; "
                   f"source vectors for {len(self.user_vecs_source)} users; "
                   f"max sequence length {self.T}")
+
+            """print("re_get tweets_df")
+            with open(self.save_df_path, "rb") as f:
+                d = pickle.load(f)
+            self.tweets_df, _ = d
+
+            print("recreate user-article mask")
+            self.create_user_article_mask()
+            print("restore user-article mask")
+            self.save_precomputed_data()"""
+
+            # Build per-article user-index lists for subset-only scoring
+                # coalesce(): merge duplicate entries and finalize the sparse tensor
+            mask = self.user_article_mask.coalesce()
+            # Print basic info about the sparse mask
+            print(f"[Init] user_article_mask shape: {self.user_article_mask.shape}, "
+                f"non-zero entries: {mask._nnz()}")
+
+            # Determine number of articles for correct sizing
+            n_articles = self.user_article_mask.size(0)
+
+            # indices(): returns a 2×nnz LongTensor; row0=article_idx, row1=user_idx for each engagement
+            thread_idxs, user_idxs = mask.indices()
+
+            # Prepare: a Python list where each element is the list of engaged user indices for that article
+            article_user_idxs = [[] for _ in range(n_articles)]
+            for t, u in zip(thread_idxs.tolist(), user_idxs.tolist()):#iterate at the 2 list
+                article_user_idxs[t].append(u)
+
+            # Convert each list into a 1D LongTensor
+            self.article_user_idxs = [torch.tensor(lst, dtype=torch.long)
+                                    for lst in article_user_idxs]
+
+            # Print summary of article_user_idxs
+            print(f"[Init] Built article_user_idxs for {len(self.article_user_idxs)} articles.")
+            print(f"[Init] Example: article 0 has {len(self.article_user_idxs[0])} engaged users.")
+                # Done: we already have everything from precomputed cache
             return
-
-        print("Build user vectors")
-        self._build_user_vectors()
-        print("User vectors built")
-
-        print("Precompute embeddings")
-        self._precompute_embeddings()
-        print("Embeddings precomputed")
-
-        print("Build article sequences")
-        self._build_threads_sequences()
-        print("Article sequences built")
-
-        print("Free memory")
-        gc.collect()
-
-        print("Save precomputed data")
-        self.save_precomputed_data()
-        print("Data saved")
+        else:
+            print("Parse all threads")
+            self.tweets_df, self.threads_source = self._parse_all_threads(event_fraction=self.event_fraction)
+            print("Caching parsed DataFrame")
+            print(f"DataFrame parsed: {self.tweets_df.shape}, events: {len(self.threads_source)}")
+            
+            with open(self.save_df_path, "wb") as f:
+                pickle.dump((self.tweets_df, self.threads_source), f)
 
 
-    # ------------------------------------------------------------------
-    # 1. Source-post table  (threads_source & labels)
-    # ------------------------------------------------------------------
+            print("Build user vectors")
+            self._build_user_vectors()
+            print("User vectors built")
+
+            print("Precompute embeddings")
+            self._precompute_embeddings()
+            print("Embeddings precomputed")
+
+            print("Build article sequences")
+            self._build_threads_sequences()
+            print("Article sequences built")
+
+            print("Create user-article mask")
+            self.create_user_article_mask()
+            print("User-article mask created")
+            del self.tweets_df
+            print("Free memory")
+            gc.collect()
+
+            print("Save precomputed data")
+            self.save_precomputed_data()
+            print("Data saved")
+
+    def create_user_article_mask(self):
+        threads_ids = list(self.threads_seq.keys())
+        user_ids = list(self.user_vecs_source.keys())
+        thread_idx_map = {tid: idx for idx, tid in enumerate(threads_ids)}
+        user_idx_map = {uid: idx for idx, uid in enumerate(user_ids)}
+        
+        # dataframe with 2 colomn, thread id and user id for all tweets,
+        #then remove the duplicates to get unique thread and user pairss
+        pairs = self.tweets_df[['thread_id', 'user_id']].drop_duplicates()
+        
+        # add 2 new colomns idXXXXX ! map will transform the thread_id and user_id to their respective indices
+        pairs['thread_idx'] = pairs['thread_id'].map(thread_idx_map)
+        
+        pairs['user_idx'] = pairs['user_id'].map(user_idx_map)
+        
+        # Drop any rows where mapping failed
+        pairs = pairs.dropna(subset=['thread_idx', 'user_idx'])
+        thread_idxs = pairs['thread_idx'].astype(int).to_numpy()
+        user_idxs = pairs['user_idx'].astype(int).to_numpy()
+        
+        # Build sparse tensor
+        indices = torch.stack([
+            torch.tensor(thread_idxs, dtype=torch.long),
+            torch.tensor(user_idxs, dtype=torch.long)
+        ]) # [[thread_idx1, thread_idx2, ...], [user_idx1, user_idx2, ...]] for COO matrix
+        values = torch.ones(len(thread_idxs), dtype=torch.bool)
+        sparse_mask = torch.sparse_coo_tensor(
+            indices, values,
+            torch.Size([len(threads_ids), len(user_ids)])
+        )
+        
+        self.user_article_mask = sparse_mask
+        return None
+
+    #to remove bc notused
     def _extract_thread_sources(self):
+        """besoin thread_source pour build thread sequences, """
         src_rows = self.tweets_df[self.tweets_df["parent_id"].isna()]      # root posts
         for _, row in src_rows.iterrows():
             tid = row["thread_id"]
@@ -149,14 +219,15 @@ class WeiboDataBase:
                 "source_id": row["tweet_id"],
                 "user_id"  : row["user_id"],
                 "time"     : int(row["ts"]),
-                "label"    : self.events[tid]["label"]
+                "label"    : self.threads_source[tid]["label"]
             }
-            self.labels[tid] = self.events[tid]["label"]
+            self.labels[tid] = self.threads_source[tid]["label"]
 
 
     def _parse_all_threads(self, event_fraction: float = 0.2):
         """
-        Replicates the data‑loading logic that previously lived in parseTest.py.
+        event = thread
+        Replicates the data-loading logic that previously lived in parseTest.py.
 
         Parameters
         ----------
@@ -253,7 +324,7 @@ class WeiboDataBase:
         print(f"Label distribution (0 = non‑rumor, 1 = rumor): {dict(label_dist)}")
         print("DataFrame head:\n", df.head())
         print("dtypes:\n", df.dtypes)
-
+        #events = thread
         return df, {eid: events[eid] for eid in selected_event_ids}
 
 
@@ -290,57 +361,7 @@ class WeiboDataBase:
         print("head of tweets_df: ", self.tweets_df.head())
         print("tail of tweets_df: ", self.tweets_df.tail())
 
-    def _build_user_vectors_global(self):
-        user_ids   = self.tweets_df["user_id"].unique()
-        thread_ids = self.tweets_df["thread_id"].unique()
-        u_idx = {u:i for i,u in enumerate(user_ids)}
-        t_idx = {t:i for i,t in enumerate(thread_ids)}
 
-        print(f" {len(u_idx)} users and {len(t_idx)} threads")
-
-        # incidence: rows=user, cols=thread
-        pairs = {(u_idx[u], t_idx[t]) for u,t in zip(self.tweets_df["user_id"], self.tweets_df["thread_id"])}
-        rows, cols = zip(*pairs)
-        data = np.ones(len(rows))
-        M = csr_matrix((data, (rows, cols)), shape=(len(u_idx), len(t_idx)))
-
-        print(f"CSR matrix shape: {M.shape}")
-        
-        print(f"SVD with k={self.dim_x_u}")
-
-        U, _, _ = svds(M, k=self.dim_x_u)
-
-        print("SVD completed")
-        for uid, i in u_idx.items():
-            self.user_vecs_global[uid] = U[i]
-        print(f"user_vecs_global built: {len(self.user_vecs_global)} users × {self.dim_x_u} dims")
-
-    def _build_user_vectors_source(self):
-        u_idx = {u:i for i,u in enumerate(self.tweets_df["user_id"].unique())}
-        pairs_counter = Counter()
-
-        # build weighted graph: common-thread co-occurrence
-        for tid, grp in self.tweets_df.groupby("thread_id"):
-            users = sorted({u_idx[u] for u in grp["user_id"]})
-            for i in range(len(users)):
-                for j in range(i+1, len(users)):
-                    pairs_counter[(users[i], users[j])] += 1
-
-        rows, cols, w = [],[],[]
-        for (i,j), wt in pairs_counter.items():
-            rows.extend((i,j))
-            cols.extend((j,i))
-            w.extend((wt,wt))
-
-        A = csr_matrix((w, (rows, cols)), shape=(len(u_idx), len(u_idx)))
-        U, _, _ = svds(A, k=self.dim_y_i)
-        for uid, i in u_idx.items():
-            self.user_vecs_source[uid] = U[i]
-        print(f"user_vecs_source built: {len(self.user_vecs_source)} users × {self.dim_y_i} dims")
-
-    # ------------------------------------------------------------------
-    # 4. Thread sequences  (Capture module prep)
-    # ------------------------------------------------------------------
     def _build_threads_sequences(self):
         seq_lengths = []
         for tid, grp in self.tweets_df.groupby("thread_id"):
@@ -381,18 +402,19 @@ class WeiboDataBase:
         return self.threads_seq[art_id], self.labels[art_id]
 
     def user_feature_matrix(self):
+        print("Getting user feature matrix")
         ids = list(self.user_vecs_source.keys())
         mat = np.vstack([self.user_vecs_source[u] for u in ids])
         return ids, mat
-    # ------------------------------------------------------------------
-    #  Utility: write all heavy pre‑computations as a single .npy
-    # ------------------------------------------------------------------
+
     def save_precomputed_data(self):
         cache = {
             "threads_seq": self.threads_seq,
             "labels": self.labels,
             "user_vecs_global": self.user_vecs_global,
             "user_vecs_source": self.user_vecs_source,
+            "user_article_mask": self.user_article_mask,
+            "threads_source": self.threads_source
         }
         print(f"Saving precomputed data to {self.precomputed_data_path}")
         with open(self.precomputed_data_path, "wb") as f:

@@ -69,6 +69,7 @@ class DataBase:
         #user vector for score using weighted user graph
         self.user_vecs_source = {} #dict with key = user_id and value = vector of the user
         self.device = device
+        self.frac = 1
         self.initilize_data()
         
 
@@ -555,22 +556,40 @@ class DataBase:
 
 
 
-
 class RumorDataset(Dataset):
-    def __init__(self, lengths, article_features, user_features, labels, user_article_mask, device):
-        self.article_features = article_features
-        self.user_features = user_features
-        self.labels = labels
-        self.user_article_mask = user_article_mask.to(device)
-        self.lengths = lengths
-    def __len__(self):
-        return len(self.article_features)
-    
-    def __getitem__(self, idx):  
+    def __init__(
+            self, lengths, article_features, user_features, 
+            labels, article_user_idxs, device
+    ):
+        self.article_features    = article_features
+        self.user_features       = user_features
+        self.labels              = labels
+        # New: store the per-article list of engaged-user indices
+        self.article_user_idxs   = article_user_idxs
+        self.lengths             = lengths
+
+    def __getitem__(self, idx): #idx associated to the article/thread id
+        # Fetch indices of engaged users for this article
+        idxs = self.article_user_idxs[idx]
+        # Gather their feature vectors (n_engaged x dim_y_i)
+        y_is = self.user_features[idxs]
         return {
             'article_features': self.article_features[idx],
-            #'user_features': self.user_features, because it's the same for all
-            'labels': self.labels[idx],
-            'user_article_mask': self.user_article_mask[idx],
-            'lengths': self.lengths[idx]    
+            'labels':          self.labels[idx],
+            # y_is: tensor of shape (n_engaged, dim_y_i)
+            'y_is':            y_is,
+            'lengths':         self.lengths[idx]
         }
+    
+def rumor_collate(batch):
+    # batch: list of dicts
+    article_feats = torch.stack([b['article_features'] for b in batch])
+    lengths       = torch.tensor([b['lengths']       for b in batch], dtype=torch.long)
+    labels        = torch.tensor([b['labels']        for b in batch], dtype=torch.long)
+    y_is_list     = [b['y_is'] for b in batch]  # list of (n_engaged_i, dim_y)
+    return {
+      'article_features': article_feats,
+      'lengths': lengths,
+      'labels': labels,
+      'y_is': y_is_list
+    }

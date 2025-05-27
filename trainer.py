@@ -9,6 +9,7 @@ import gc
 from pathlib import Path
 
 
+
 class Trainer:
 
     """  main.py :   if torch.backends.mps.is_available():
@@ -40,7 +41,7 @@ class Trainer:
             database,
             device, 
             learning_rate=0.001, 
-            batch_size=64, 
+            batch_size=256, 
             threshold=0.5,
             dim_hidden=50,
             dim_v_j=100,
@@ -48,8 +49,10 @@ class Trainer:
             reg_all=False
     ):
         self.model = None
+        self.optimizer = None
+        self.scheduler = None
         self.database = database
-        self.max_seq_len = 20 #self.database.T
+        self.max_seq_len = 15 #self.database.T 
         self.device = device
         self.threshold = threshold
         self.dim_hidden = dim_hidden
@@ -57,31 +60,24 @@ class Trainer:
         self.lambda_reg = lambda_reg
         self.reg_all = reg_all
 
-        self.user_ids, self.user_features = self.database.user_feature_matrix()
-        # trainer.py  __init__
-        self.user_features_tensor = torch.tensor(
-            self.user_features, dtype=torch.float, device=self.device, requires_grad=False
-        )
+        self.user_features_tensor = self.set_user_features_tensor()
+
         self.article_ids = self.database.article_ids()
-        #anciennemnet X_sequences, y_labels = create_dataset() #label dit si rumeur ou pas et X_sequ=[eta, delta_t, x_u, x_tau]
         self.X_sequences, self.lengths, self.y_labels = self.create_X_y()
-
-        
-
-
-        self.user_article_mask = self.create_user_article_mask()
-
+        self._free_memory()
     
         
+
 
         self.dataset = RP.RumorDataset(
             lengths=self.lengths,
             article_features=self.X_sequences,
             user_features=self.user_features_tensor,
             labels=self.y_labels,
-            user_article_mask=self.user_article_mask,
+            article_user_idxs=self.database.article_user_idxs,
             device=self.device
         )
+
         # Balance the dataset by undersampling the majority class
         labels = self.dataset.labels
         neg_idx = (labels == 0).nonzero(as_tuple=True)[0]
@@ -97,23 +93,8 @@ class Trainer:
 
 
         self.set_model()
-        self.optimizer = optim.Adam(
-            self.model.parameters(), 
-            lr=learning_rate
-        )
-        # Add learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
-            mode='min', 
-            factor=0.1, 
-            patience=8 # Reduce LR after 8 epochs without validation loss improvement (matching early stopping patience)
-        )
 
-        log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / "modeltest1"
-        log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
-        self.writer = torch.utils.tensorboard.SummaryWriter(log_dir=str(log_dir))
-
-
+        
         self.train_dataset = None
         self.val_dataset = None
         self.set_train_val_dataset()
@@ -121,11 +102,21 @@ class Trainer:
         self.standardize_data()
 
         
-        self.train_loader = DataLoader(self.train_dataset,
-                                       batch_size=batch_size,
-                                       sampler=None)
+        self.train_loader = DataLoader(
+            dataset=self.train_dataset,
+            batch_size=batch_size,
+            sampler=None,
+            collate_fn=RP.database.collate_fn
+        )  # Use custom collate function to handle variable-length sequences)
         # keep the validation loader unchanged        
-        self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size)
+        self.val_loader = DataLoader(
+            dataset=self.val_dataset, 
+            batch_size=batch_size,
+            collate_fn=RP.database.collate_fn
+        )
+
+        self.set_optimizer_and_scheduler(learning_rate)
+        self.writer = self.set_tensorboard_logs()
 
         # Print label distributions for checking class balance
         total_counts = torch.bincount(self.balanced_labels)
@@ -134,7 +125,33 @@ class Trainer:
         print(f"Training label distribution: {{'neg': {train_counts[0].item()}, 'pos': {train_counts[1].item()}}}")
         val_counts = torch.bincount(self.balanced_labels[self.val_dataset.indices])
         print(f"Validation label distribution: {{'neg': {val_counts[0].item()}, 'pos': {val_counts[1].item()}}}")
+
+
+    def set_train_val_dataset(self):
+        # Retrieve labels for the current dataset, handling Subset wrappers
+        base_labels = self.dataset.dataset.labels
+        indices = self.dataset.indices
+        labels = base_labels[indices].cpu().numpy()
+    
+        splitter = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=0.2,
+            random_state=RP.config.SEED_RAND
+        )
+        train_idx, val_idx = next(
+            splitter.split(
+                np.zeros(len(labels)),
+                labels
+            )
+        )
+        self.train_dataset = Subset(self.dataset, train_idx)
+        self.val_dataset = Subset(self.dataset, val_idx)
         
+        # Free additional memory now that datasets are created
+        self._free_train_memory()
+    
+        return None
+    
     def standardize_data(self):
         print("Standardizing data...")
         # Get only training indices from the original features
@@ -177,6 +194,60 @@ class Trainer:
             # Only standardize up to the actual length
             seq[:length, :2] = (seq[:length, :2] - self.scalar_means) / self.scalar_stds
         return seq
+
+       
+    def set_user_features_tensor(self):
+        self.user_ids, self.user_features = self.database.user_feature_matrix()
+    
+        return torch.tensor(
+            data=self.user_features, 
+            dtype=torch.float, 
+            device=self.device, 
+            requires_grad=False
+        )
+
+
+    def set_tensorboard_logs(self):
+        log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / \
+            f"seqlen{self.max_seq_len}_dimvj{self.dim_v_j}_dimh{self.dim_hidden}_frac{self.database.frac}"
+        log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
+        return torch.utils.tensorboard.SummaryWriter(log_dir=str(log_dir))
+
+
+    def _free_memory(self):
+        """Free unnecessary data structures from memory after tensor creation"""
+        print("Freeing memory...")
+        
+        # Free large database structures
+        if hasattr(self.database, 'tweets_df') and self.database.tweets_df is not None:
+            del self.database.tweets_df
+            
+        # Clear threads_seq and other large structures after we've extracted what we need
+        large_db_attrs = ['threads_seq', 'events', 'threads_source', 'user_vecs_global', 'user_vecs_source']
+        for attr in large_db_attrs:
+            if hasattr(self.database, attr) and getattr(self.database, attr) is not None:
+                setattr(self.database, attr, None)
+        
+        # Clear original numpy user features as we now have the tensor version
+        if hasattr(self, 'user_features') and self.user_features is not None:
+            del self.user_features
+        
+        # After creating datasets, many original structures aren't needed
+        # We'll do this in a subsequent call from train() or after dataset creation
+        # as we still need these for dataset creation
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear GPU cache if using GPU
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        elif self.device.type == 'mps':
+            torch.mps.empty_cache()
+        
+        print("Memory freed")
+    
+    
     def set_model(self):
 
         #capture
@@ -209,7 +280,7 @@ class Trainer:
             dim_embedding_wu=dim_embedding_wu
         ).to(self.device)
 
-        # after you create self.model
+        #maybe remove
         with torch.no_grad():
             # final sigmoid layer is self.model.integrate_module.fc
             # bias = log(pos/neg)
@@ -217,10 +288,24 @@ class Trainer:
             neg = (self.balanced_labels == 0).sum().item()
             init_bias = np.log(pos / neg)
             self.model.integrate_module.fc.bias.fill_(init_bias)
-        
+
+    def set_optimizer_and_scheduler(self, learning_rate):
+        self.optimizer = optim.Adam(
+            params=self.model.parameters(), 
+            lr    =learning_rate
+        )
+        # Add learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode    ='min', 
+            factor  =0.1, 
+            patience=8 # Reduce LR after 8 epochs without validation loss improvement (matching early stopping patience)
+        )
+
+    
     def train(self, num_epochs=20):
 
-        patience = 8 # Increased patience to allow scheduler to trigger
+        patience = 15 # Increased patience to allow scheduler to trigger
         best_val_loss = float('inf')
         epochs_no_improve = 0
 
@@ -229,8 +314,7 @@ class Trainer:
         print(f"Training set size: {len(self.train_dataset)}")
         print(f"Validation set size: {len(self.val_dataset)}")
         print(f"User features shape: {self.user_features_tensor.shape}")
-        print(f"User-article mask shape: {self.user_article_mask.shape}")
-        print(f"Non-zero entries in mask: {self.user_article_mask.sum().item()}")
+        print(f"Example: article 0 has {len(self.database.article_user_idxs[0])} engaged users")
 
         for epoch in range(num_epochs):
             total_loss_training=0
@@ -239,26 +323,23 @@ class Trainer:
 
             #trainign loop
             for batch in self.train_loader:
-                article_features = batch['article_features'].to(self.device)
-                #user_features = batch['user_features'].to(self.device)
-                user_features = self.user_features_tensor #why not in model directly ?
-                labels = batch['labels'].to(self.device)
-                mask = batch['user_article_mask'].to(self.device)
-                lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
-
                 self.optimizer.zero_grad()
 
-
+                # batch['y_is'] is (n_engaged, dim_y_i) per example
+                y_is = batch['y_is'].to(self.device)
                 predictions, user_repr, article_repr = self.model(
-                    x_t=article_features, 
-                    lengths=lengths, 
-                    y_i=user_features, 
-                    m_j=mask
+                    x_t    =batch['article_features'].to(self.device), 
+                    lengths=batch['lengths'], 
+                    y_is   =y_is
                 )
 
                 Wu = self.model.get_wu()
 
-                loss = self.loss_function(predictions, labels, Wu)
+                loss = self.loss_function(
+                    predictions, 
+                    batch['labels'].to(self.device), 
+                    Wu
+                )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
@@ -270,19 +351,17 @@ class Trainer:
             all_labels = []
             all_preds = []
             for batch in self.val_loader:
-                article_features = batch['article_features'].to(self.device)
-                #user_features = batch['user_features'].to(self.device)
-                user_features = self.user_features_tensor #why not in model directly ?
 
                 labels = batch['labels'].to(self.device).float()
-                mask = batch['user_article_mask'].to(self.device)
-                lengths = batch['lengths']            # keep on CPU for pack_padded_sequence
-
                 with torch.no_grad():
+                    y_is = batch['y_is'].to(self.device)
                     predictions, user_repr, article_repr = self.model(
-                        article_features, lengths, user_features, mask
+                        x_t    =batch['article_features'].to(self.device),
+                        lengths= batch['lengths'],
+                        y_is   =y_is
                     )
                     Wu = self.model.get_wu()
+
                     loss = self.loss_function(predictions, labels, Wu)
                     total_loss_validation += loss.item()
 
@@ -328,77 +407,65 @@ class Trainer:
                 
 
 
-    def set_train_val_dataset(self):
-        # Retrieve labels for the current dataset, handling Subset wrappers
-        base_labels = self.dataset.dataset.labels
-        indices = self.dataset.indices
-        labels = base_labels[indices].cpu().numpy()
-    
-        splitter = StratifiedShuffleSplit(
-            n_splits=1,
-            test_size=0.2,
-            random_state=RP.config.SEED_RAND
-        )
-        train_idx, val_idx = next(
-            splitter.split(
-                np.zeros(len(labels)),
-                labels
-            )
-        )
-        self.train_dataset = Subset(self.dataset, train_idx)
-        self.val_dataset = Subset(self.dataset, val_idx)
-        return None
 
-    def create_user_article_mask(self):
-        user_id_to_idx = {uid: i for i, uid in enumerate(self.user_ids)}
-        user_article_mask = torch.zeros(
-            len(self.article_ids), 
-            len(self.user_ids),
-            dtype=torch.bool
-        )
-        for i, art_id in enumerate(self.article_ids):
-            thread_users = self.database.tweets_df[self.database.tweets_df.thread_id == art_id].user_id.unique()
-            for user_id in thread_users:
-                if user_id in user_id_to_idx:
-                    user_article_mask[i, user_id_to_idx[user_id]] = True
-        return user_article_mask
 
+    def _free_train_memory(self):
+        """Free memory after datasets are created but before training"""
+        print("Freeing additional memory before training...")
+        
+        # Reference to database is no longer needed after dataset creation
+        self.database = None
+        
+        # We only need the article IDs for the user_article_mask creation
+        self.article_ids = None
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear GPU cache again
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        
+        print("Additional memory freed")
 
     def create_X_y(self):
-        #pour convertir les données en tensor
         X_sequences = []
         lengths = []
         y_labels = []
         
         for art_id in self.article_ids:
             seq, label = self.database.article_sequence(art_id)
+            # Immediately limit sequence to max_seq_len to save memory
+            if len(seq) > self.max_seq_len:
+                seq = seq[:self.max_seq_len]
+            
             size_raw = len(seq)
             lengths.append(size_raw)
-            feature_list = []
-            for item in seq:
-                # Format: [eta, delta_t, x_u, x_tau]
+            
+            # Create tensor directly at the right size to avoid list conversion
+            if seq:
+                feature_dim = 2 + len(seq[0]['x_u']) + len(seq[0]['x_tau'])
+            else:
+                feature_dim = 0
+            raw = torch.zeros(
+                size =(self.max_seq_len, feature_dim), 
+                dtype=torch.float
+            )
+            
+            # Only fill valid timesteps
+            for j, item in enumerate(seq):
                 features = [item['eta'], item['delta_t']]
                 features.extend(item['x_u'])
                 features.extend(item['x_tau'])
-                feature_list.append(features)
-
-            #normalization ? to device ?
-            raw = torch.tensor(feature_list, dtype=torch.float)
-                    # pad (or truncate) to exactly 27 timesteps
-            max_len = self.max_seq_len  # New fixed maximum length
-            if raw.size(0) > max_len:
-                # Truncate to first 10 timesteps
-                raw = raw[:max_len]
-                # Update the stored length if we truncated
-                lengths[-1] = max_len
-            elif raw.size(0) < max_len:
-                # Pad with zeros at the end
-                pad = torch.zeros((max_len - raw.size(0), raw.size(1)), device=raw.device)
-                raw = torch.cat([raw, pad], dim=0)
+                raw[j] = torch.tensor(features, dtype=torch.float)
+            
             X_sequences.append(raw)
             y_labels.append(label)
-
-
+            
+            # Clear seq after processing to free memory during loop
+            seq = None
             
         X = torch.stack(X_sequences)
         L = torch.tensor(lengths, dtype=torch.long)
@@ -406,19 +473,8 @@ class Trainer:
         return X, L, Y
 
 
-    """
-    def loss_function(self, predictions, labels, Wu, eps=1e-7):
-        p = predictions.clamp(eps, 1. - eps)          # avoid 0 or 1
-        l_acc = -(labels * p.log() + (1 - labels) * (1 - p).log()).mean()
-        if self.reg_all:
-                l_reg = 0
-                for param in self.model.parameters():
-                    l_reg += self.lambda_reg * param.norm(p=2).pow(2) / 2
-                
-        else:
-            l_reg = self.lambda_reg * Wu.norm(p=2).pow(2) / 2  # same regulariser
-        
-        return l_acc + l_reg"""
+
+
     
     def loss_function(self, predictions, labels, Wu, eps=1e-7):
         # Binary cross-entropy loss
