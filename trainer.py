@@ -8,6 +8,10 @@ import numpy as np
 import gc
 from pathlib import Path
 
+# for reproducibility
+torch.manual_seed(RP.config.SEED_TORCH)  
+np.random.seed(RP.config.SEED_NP)
+
 
 
 class Trainer:
@@ -41,34 +45,41 @@ class Trainer:
             database,
             device, 
             learning_rate=0.001, 
+            max_seq_len=50,  # Maximum sequence length for articles
             batch_size=256, 
             threshold=0.5,
             dim_hidden=50,
             dim_v_j=100,
             lambda_reg=0.01,
-            reg_all=False
+            reg_all=False,
+            simple_model=False, # If True, use a simpler model
+            balance_classes=False
     ):
         self.model = None
+        self.simple_model = simple_model
         self.optimizer = None
         self.scheduler = None
         self.database = database
-        self.max_seq_len = 15 #self.database.T 
+        self.frac_data = database.frac
+        self.balance_classes = balance_classes
+        self.max_seq_len = max_seq_len #self.database.T 
         self.device = device
         self.threshold = threshold
         self.dim_hidden = dim_hidden
         self.dim_v_j = dim_v_j
         self.lambda_reg = lambda_reg
         self.reg_all = reg_all
+        self.learning_rate = learning_rate
 
-        self.user_features_tensor = self.set_user_features_tensor()
+        self.user_features_tensor = self.get_user_features_tensor()
 
         self.article_ids = self.database.article_ids()
+
+
+
         self.X_sequences, self.lengths, self.y_labels = self.create_X_y()
         self._free_memory()
     
-        
-
-
         self.dataset = RP.RumorDataset(
             lengths=self.lengths,
             article_features=self.X_sequences,
@@ -78,20 +89,24 @@ class Trainer:
             device=self.device
         )
 
+        orig_counts = torch.bincount(self.dataset.labels)
+        print(f"[Dataset] Original label distribution: "
+        f"{{'neg': {orig_counts[0].item()}, 'pos': {orig_counts[1].item()}}}")
         # Balance the dataset by undersampling the majority class
-        labels = self.dataset.labels
-        neg_idx = (labels == 0).nonzero(as_tuple=True)[0]
-        pos_idx = (labels == 1).nonzero(as_tuple=True)[0]
-        min_count = min(len(neg_idx), len(pos_idx))
-        # reproducible random sampling
-        g = torch.Generator().manual_seed(RP.config.SEED_RAND)
-        neg_sample = neg_idx[torch.randperm(len(neg_idx), generator=g)[:min_count]]
-        pos_sample = pos_idx[torch.randperm(len(pos_idx), generator=g)[:min_count]]
-        balanced_idx = torch.cat([neg_sample, pos_sample])
-        self.dataset = Subset(self.dataset, balanced_idx.tolist())
-        self.balanced_labels = self.dataset.dataset.labels[self.dataset.indices]
-
-
+        if balance_classes:
+            labels = self.dataset.labels
+            neg_idx = (labels == 0).nonzero(as_tuple=True)[0]
+            pos_idx = (labels == 1).nonzero(as_tuple=True)[0]
+            min_count = min(len(neg_idx), len(pos_idx))
+            # reproducible random sampling
+            g = torch.Generator().manual_seed(RP.config.SEED_RAND)
+            neg_sample = neg_idx[torch.randperm(len(neg_idx), generator=g)[:min_count]]
+            pos_sample = pos_idx[torch.randperm(len(pos_idx), generator=g)[:min_count]]
+            balanced_idx = torch.cat([neg_sample, pos_sample])
+            self.dataset = Subset(self.dataset, balanced_idx.tolist())
+            self.balanced_labels = self.dataset.dataset.labels[self.dataset.indices]
+        else:
+            self.balanced_labels = self.dataset.labels
         self.set_model()
 
         
@@ -100,22 +115,28 @@ class Trainer:
         self.set_train_val_dataset()
 
         self.standardize_data()
-
+        # ── One‑time device transfer of all article tensors ────────────
+        if self.device.type in {"cuda", "mps"}:
+            # self.X_sequences is shared by every Dataset/Subset slice,
+            # so moving it once avoids per‑batch .to(device) copies.
+            self.X_sequences = self.X_sequences.to(self.device, non_blocking=True)
+            # Keep the RumorDataset reference in sync
+            self.dataset.dataset.article_features = self.X_sequences
         
         self.train_loader = DataLoader(
             dataset=self.train_dataset,
             batch_size=batch_size,
             sampler=None,
-            collate_fn=RP.database.collate_fn
+            collate_fn=RP.dataBase.rumor_collate
         )  # Use custom collate function to handle variable-length sequences)
         # keep the validation loader unchanged        
         self.val_loader = DataLoader(
             dataset=self.val_dataset, 
             batch_size=batch_size,
-            collate_fn=RP.database.collate_fn
+            collate_fn=RP.dataBase.rumor_collate
         )
 
-        self.set_optimizer_and_scheduler(learning_rate)
+        self.set_optimizer_and_scheduler()
         self.writer = self.set_tensorboard_logs()
 
         # Print label distributions for checking class balance
@@ -155,48 +176,87 @@ class Trainer:
     def standardize_data(self):
         print("Standardizing data...")
         # Get only training indices from the original features
-        train_indices = [self.dataset.indices[i] for i in self.train_dataset.indices]
-        
-        # Collect valid timesteps from training data only
-        valid_timesteps = []
+        train_indices = []
+        for i in self.train_dataset.indices:
+            train_indices.append(self.dataset.indices[i])
+
+        sum_values = torch.zeros(2)
+        sum_squares = torch.zeros(2)
+        count = 0
+
         for idx in train_indices:
             seq = self.X_sequences[idx]
-            length = self.lengths[idx]
-            valid_timesteps.append(seq[:length])
+            length = self.lengths[idx].item()
+            valid_data = seq[:length, :2]
+            
+            # Log-transform in-place
+            valid_data[:, 0].log1p_()
+            valid_data[:, 1].log1p_()
+            
+            sum_values += valid_data.sum(dim=0)
+            sum_squares += (valid_data ** 2).sum(dim=0)
+            count += length
+
+        self.scalar_means = sum_values / count
+        self.scalar_stds = (sum_squares / count - self.scalar_means ** 2).sqrt().clamp_min(1e-6)
+
+    # Standardize ALL sequences in-place
+        for seq, length in zip(self.X_sequences, self.lengths):
+            # Log-transform non-training sequences
+            
+            seq[:length.item(), :2].log1p_() #.item because length is a tensor of size 1
+            # Standardize
+            seq[:length.item(), :2].sub_(self.scalar_means).div_(self.scalar_stds)
         
-        flat = torch.cat(valid_timesteps, dim=0)
+        print("Standardization complete.")    
+
+
+    
+    def create_X_y(self):
+        X_sequences = []
+        lengths = []
+        y_labels = []
         
-        # Log-transform the first two features on training data
-        flat[:, 0] = torch.log1p(flat[:, 0])
-        flat[:, 1] = torch.log1p(flat[:, 1])
-        
-        # Compute means and stds ONLY for scalar features (first two columns)
-        # These features are already log-transformed in DataBase.py
-        self.scalar_means = flat[:, :2].mean(dim=0)
-        self.scalar_stds = flat[:, :2].std(dim=0).clamp_min(1e-6)
-        
-        # Now standardize ALL data using train-derived stats
-        # The log transformation is now done in DataBase.py
-        self.X_sequences = torch.stack([
-            self._standardise_seq(seq, length) 
-            for seq, length in zip(self.X_sequences, self.lengths)
-        ])
-        
-        # Update the datasets with standardized features
-        self.dataset.dataset.article_features = self.X_sequences
-        print("Standardization complete.")
-    def _standardise_seq(self, seq, length=None):
-        seq = seq.clone()
-        # If length not provided, standardize the whole sequence
-        if length is None:
-            seq[:, :2] = (seq[:, :2] - self.scalar_means) / self.scalar_stds
-        else:
-            # Only standardize up to the actual length
-            seq[:length, :2] = (seq[:length, :2] - self.scalar_means) / self.scalar_stds
-        return seq
+        for art_id in self.article_ids:
+            seq, label = self.database.article_sequence(art_id)
+            # Immediately limit sequence to max_seq_len to save memory
+            if len(seq) > self.max_seq_len:
+                seq = seq[:self.max_seq_len]
+            
+            size_raw = len(seq)
+            lengths.append(size_raw)
+            
+            # Create tensor directly at the right size to avoid list conversion
+            if seq:
+                feature_dim = 2 + len(seq[0]['x_u']) + len(seq[0]['x_tau'])
+            else:
+                feature_dim = 0
+            raw = torch.zeros(
+                size =(self.max_seq_len, feature_dim), 
+                dtype=torch.float
+            )
+            
+            # Only fill valid timesteps
+            for j, item in enumerate(seq):
+                features = [item['eta'], item['delta_t']]
+                features.extend(item['x_u'])
+                features.extend(item['x_tau'])
+                raw[j] = torch.tensor(features, dtype=torch.float)
+            
+            X_sequences.append(raw)
+            y_labels.append(label)
+            
+            # Clear seq after processing to free memory during loop
+            seq = None
+            
+        X = torch.stack(X_sequences)
+        L = torch.tensor(lengths, dtype=torch.long)
+        Y = torch.tensor(y_labels, dtype=torch.long)
+        return X, L, Y
+
 
        
-    def set_user_features_tensor(self):
+    def get_user_features_tensor(self):
         self.user_ids, self.user_features = self.database.user_feature_matrix()
     
         return torch.tensor(
@@ -206,26 +266,34 @@ class Trainer:
             requires_grad=False
         )
 
-
     def set_tensorboard_logs(self):
-        log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / \
-            f"seqlen{self.max_seq_len}_dimvj{self.dim_v_j}_dimh{self.dim_hidden}_frac{self.database.frac}"
+        if self.simple_model:
+                log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / \
+                f"Simple_seqlen{self.max_seq_len}_dimvj{self.dim_v_j}_dimh{self.dim_hidden}_frac{self.frac_data}_lr{self.learning_rate}_reg{self.lambda_reg}_regall{self.reg_all}"
+        else:
+            log_dir = Path(RP.config.LOGS_DIR) / "tensorboard" / \
+                f"seqlen{self.max_seq_len}_dimvj{self.dim_v_j}_dimh{self.dim_hidden}_frac{self.frac_data}_lr{self.learning_rate}_reg{self.lambda_reg}_regall{self.reg_all}_balance{self.balance_classes}"
         log_dir.mkdir(parents=True, exist_ok=True)  # create directory if it doesn't exist
         return torch.utils.tensorboard.SummaryWriter(log_dir=str(log_dir))
-
 
     def _free_memory(self):
         """Free unnecessary data structures from memory after tensor creation"""
         print("Freeing memory...")
         
         # Free large database structures
-        if hasattr(self.database, 'tweets_df') and self.database.tweets_df is not None:
+        if hasattr(self.database, 'tweets_df') \
+        and self.database.tweets_df is not None:
             del self.database.tweets_df
             
         # Clear threads_seq and other large structures after we've extracted what we need
-        large_db_attrs = ['threads_seq', 'events', 'threads_source', 'user_vecs_global', 'user_vecs_source']
+        large_db_attrs = [
+            'threads_seq', 'events', 
+            'threads_source', 'user_vecs_global', 
+            'user_vecs_source'
+        ]
         for attr in large_db_attrs:
-            if hasattr(self.database, attr) and getattr(self.database, attr) is not None:
+            if hasattr(self.database, attr) \
+            and getattr(self.database, attr) is not None:
                 setattr(self.database, attr, None)
         
         # Clear original numpy user features as we now have the tensor version
@@ -270,29 +338,38 @@ class Trainer:
         dim_c_j = dim_v_j + dim_s_i
         dim_w_c = dim_c_j
 
+        if self.simple_model:
+            self.model = RP.Simple_CSI_model(
+                dim_x_t=dim_x_t,
+                dim_embedding_wa=dim_embedding_wa, #choisir pour que x_t tilde ait dim=100?
+                dim_hidden=dim_hidden, #au pif? oui
+                dim_v_j=dim_v_j,
+                dim_y_i=dim_y_i,
+                dim_embedding_wu=dim_embedding_wu
+            ).to(self.device)
+        else:
+            self.model = RP.CSI_model(
+                dim_x_t=dim_x_t,
+                dim_embedding_wa=dim_embedding_wa, #choisir pour que x_t tilde ait dim=100?
+                dim_hidden=dim_hidden, #au pif? oui
+                dim_v_j=dim_v_j,
+                dim_y_i=dim_y_i,
+                dim_embedding_wu=dim_embedding_wu
+            ).to(self.device)
 
-        self.model = RP.CSI_model(
-            dim_x_t=dim_x_t,
-            dim_embedding_wa=dim_embedding_wa, #choisir pour que x_t tilde ait dim=100?
-            dim_hidden=dim_hidden, #au pif? oui
-            dim_v_j=dim_v_j,
-            dim_y_i=dim_y_i,
-            dim_embedding_wu=dim_embedding_wu
-        ).to(self.device)
-
-        #maybe remove
+        """#maybe remove
         with torch.no_grad():
             # final sigmoid layer is self.model.integrate_module.fc
             # bias = log(pos/neg)
             pos = (self.balanced_labels == 1).sum().item()
             neg = (self.balanced_labels == 0).sum().item()
             init_bias = np.log(pos / neg)
-            self.model.integrate_module.fc.bias.fill_(init_bias)
+            self.model.integrate_module.fc.bias.fill_(init_bias)"""
 
-    def set_optimizer_and_scheduler(self, learning_rate):
+    def set_optimizer_and_scheduler(self):
         self.optimizer = optim.Adam(
             params=self.model.parameters(), 
-            lr    =learning_rate
+            lr    =self.learning_rate
         )
         # Add learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -314,26 +391,30 @@ class Trainer:
         print(f"Training set size: {len(self.train_dataset)}")
         print(f"Validation set size: {len(self.val_dataset)}")
         print(f"User features shape: {self.user_features_tensor.shape}")
-        print(f"Example: article 0 has {len(self.database.article_user_idxs[0])} engaged users")
 
         for epoch in range(num_epochs):
             total_loss_training=0
             total_loss_validation=0
             self.model.train() #add dropout 0.2 on wa and wr
-
+            train_all_labels = []
+            train_all_preds = []
             #trainign loop
             for batch in self.train_loader:
                 self.optimizer.zero_grad()
 
                 # batch['y_is'] is (n_engaged, dim_y_i) per example
-                y_is = batch['y_is'].to(self.device)
-                predictions, user_repr, article_repr = self.model(
-                    x_t    =batch['article_features'].to(self.device), 
-                    lengths=batch['lengths'], 
-                    y_is   =y_is
+                predictions, user_repr, art_repr = self.model(
+                    x_t     = batch['article_features'],  # already on device
+                    lengths = batch['lengths'],
+                    y_flat  = batch['y_flat'].to(self.device), #all engaged users in the batch
+                    src_idx = batch['src_idx'].to(self.device) #to keep track of which article each user belongs to
                 )
 
-                Wu = self.model.get_wu()
+
+                if not self.simple_model: 
+                    Wu = self.model.get_wu()
+                else:
+                    Wu = None
 
                 loss = self.loss_function(
                     predictions, 
@@ -341,11 +422,23 @@ class Trainer:
                     Wu
                 )
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(
+                    parameters=self.model.parameters(), 
+                    max_norm  =5.0
+                )
                 self.optimizer.step()
                 total_loss_training += loss.item()
 
+                train_all_labels.append(batch['labels'].cpu().numpy())
+                train_all_preds.append(predictions.detach().cpu().numpy())
+
+
             total_loss_training /= len(self.train_loader)
+            train_all_labels = np.concatenate(train_all_labels)
+            train_all_preds = np.concatenate(train_all_preds)
+            train_predictions_binary = (train_all_preds >= self.threshold).astype(int)
+            train_accuracy = np.mean((train_predictions_binary == train_all_labels).astype(float))
+            
             #validation loop
             self.model.eval()
             all_labels = []
@@ -354,13 +447,17 @@ class Trainer:
 
                 labels = batch['labels'].to(self.device).float()
                 with torch.no_grad():
-                    y_is = batch['y_is'].to(self.device)
-                    predictions, user_repr, article_repr = self.model(
-                        x_t    =batch['article_features'].to(self.device),
-                        lengths= batch['lengths'],
-                        y_is   =y_is
+                    predictions, user_repr, art_repr = self.model(
+                        x_t     = batch['article_features'],
+                        lengths = batch['lengths'],
+                        y_flat  = batch['y_flat'].to(self.device),
+                        src_idx = batch['src_idx'].to(self.device)
                     )
-                    Wu = self.model.get_wu()
+
+                    if not self.simple_model: 
+                        Wu = self.model.get_wu()
+                    else:
+                        Wu = None
 
                     loss = self.loss_function(predictions, labels, Wu)
                     total_loss_validation += loss.item()
@@ -381,7 +478,8 @@ class Trainer:
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
-                    print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs).")
+                    print(f"Early stopping at epoch {epoch+1} \
+                          (no improvement for {patience} epochs).")
                     break
 
             # Convert to numpy arrays for metrics calculation
@@ -393,7 +491,8 @@ class Trainer:
             #predictions_binary = np.round(all_preds)
             custom_threshold = self.threshold  # Try different values
             predictions_binary = (all_preds >= custom_threshold).astype(int)
-            accuracy = np.mean((predictions_binary == all_labels).astype(float))
+            val_accuracy = np.mean((predictions_binary == all_labels).astype(float))
+            accuracy = val_accuracy
             print(f'Accuracy: {accuracy:.4f}')
             # At the end of validation
             unique_preds, counts = np.unique(predictions_binary, return_counts=True)
@@ -404,10 +503,13 @@ class Trainer:
             print(f'Epoch {epoch+1}/{num_epochs}, Training Loss: {total_loss_training:.4f}, Validation Loss: {total_loss_validation:.4f}')
             self.writer.add_scalar('Loss/Train', total_loss_training, epoch)
             self.writer.add_scalar('Loss/validation', total_loss_validation, epoch)
+            self.writer.add_scalar('Accuracy/Train', train_accuracy, epoch)
+            self.writer.add_scalar('Accuracy/Validation', val_accuracy, epoch)
+        
+        # Additional logging if needed
+        self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], epoch)
+        
                 
-
-
-
 
     def _free_train_memory(self):
         """Free memory after datasets are created but before training"""
@@ -420,57 +522,16 @@ class Trainer:
         self.article_ids = None
         
         # Force garbage collection
-        gc.collect()
+        
         
         # Clear GPU cache again
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if hasattr(torch, 'mps') and torch.backends.mps.is_available():
             torch.mps.empty_cache()
+        gc.collect()
         
         print("Additional memory freed")
-
-    def create_X_y(self):
-        X_sequences = []
-        lengths = []
-        y_labels = []
-        
-        for art_id in self.article_ids:
-            seq, label = self.database.article_sequence(art_id)
-            # Immediately limit sequence to max_seq_len to save memory
-            if len(seq) > self.max_seq_len:
-                seq = seq[:self.max_seq_len]
-            
-            size_raw = len(seq)
-            lengths.append(size_raw)
-            
-            # Create tensor directly at the right size to avoid list conversion
-            if seq:
-                feature_dim = 2 + len(seq[0]['x_u']) + len(seq[0]['x_tau'])
-            else:
-                feature_dim = 0
-            raw = torch.zeros(
-                size =(self.max_seq_len, feature_dim), 
-                dtype=torch.float
-            )
-            
-            # Only fill valid timesteps
-            for j, item in enumerate(seq):
-                features = [item['eta'], item['delta_t']]
-                features.extend(item['x_u'])
-                features.extend(item['x_tau'])
-                raw[j] = torch.tensor(features, dtype=torch.float)
-            
-            X_sequences.append(raw)
-            y_labels.append(label)
-            
-            # Clear seq after processing to free memory during loop
-            seq = None
-            
-        X = torch.stack(X_sequences)
-        L = torch.tensor(lengths, dtype=torch.long)
-        Y = torch.tensor(y_labels, dtype=torch.long)
-        return X, L, Y
 
 
 
@@ -493,7 +554,9 @@ class Trainer:
                 l2_reg += 0.5 * self.lambda_reg * torch.norm(param, p=2) ** 2
         else:
             # Original L2 regularization on Wu
-            l2_reg = 0.5 * self.lambda_reg * torch.norm(Wu, p=2) ** 2
+            if Wu is not None:
+                # Wu is the user weights matrix
+                l2_reg = 0.5 * self.lambda_reg * torch.norm(Wu, p=2) ** 2
         
         # Total loss
         return bce_loss + l2_reg

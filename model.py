@@ -1,6 +1,8 @@
+import rumorProject as RP
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence
+torch.manual_seed(RP.config.SEED_TORCH)
 
 
 #format input : x=(nbre_engagement, temps entre chaque engagement,source = x_u ,x_t=caractéristiques d'un texte)
@@ -18,7 +20,7 @@ class CaptureModule(nn.Module):
 
     def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
         batch_size, seq_len, feat_dim = x_t.size()
-    
+
         #process everything in the batch
         flat = x_t.view(-1, feat_dim) # the batch aren't sperated in different dimension, they just follow each other
         emb_flat = self.embedding_wa(flat) 
@@ -26,7 +28,7 @@ class CaptureModule(nn.Module):
         emb_flat = torch.tanh(emb_flat)
         x_tt = emb_flat.view(batch_size, seq_len, -1)        # (batch, seq_len, dim_emb)
         x_tt = self.dropout_wa(x_tt)
-        #tell the LSTM that the sequence might be padded
+        #tell the LSTM that the sequence might be padded even with non aanymore zero values
         packed = pack_padded_sequence(
             x_tt,
             lengths.cpu().long(),
@@ -72,8 +74,10 @@ class IntegrateModule(nn.Module):
     
     def forward(self, v_j, p_j):
         # Compute per-article average user score over the engaged subset
-    
-        c_j = torch.cat((v_j, p_j), dim=1)
+        if p_j is None:
+            c_j = v_j  # If no user scores, use only article features
+        else:
+            c_j = torch.cat((v_j, p_j), dim=1)
         return torch.sigmoid(self.fc(c_j))
 
 
@@ -91,8 +95,8 @@ class CSI_model(nn.Module):
         self.capture_module = CaptureModule(dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j)
         self.score_module = ScoreModule(dim_y_i, dim_embedding_wu)
         self.integrate_module = IntegrateModule(dim_v_j)
-
-    #y_is and s_is instead of y_i and s_i because for all enguaged users (no mask)
+    """
+       #y_is and s_is instead of y_i and s_i because for all enguaged users (no mask)
     def forward(self, x_t, lengths, y_is):
         # article score
         v_j = self.capture_module(x_t, lengths)
@@ -103,7 +107,62 @@ class CSI_model(nn.Module):
         prediction = self.integrate_module(v_j, p_j)
         prediction = prediction.squeeze(-1)
 
-        return prediction, y_i_ts, v_j
+        return prediction, y_i_ts, v_j"""
     
+    def forward(self, x_t, lengths, y_flat, src_idx):
+        B   = x_t.size(0)
+        v_j = self.capture_module(x_t, lengths)          # (B, dim_v)
+
+        # Compute the scores for every engaged user
+        s_is, _ = self.score_module(y_flat)          # (N, 1)
+
+        # --- robust aggregation ---  
+        # Avoid a trailing singleton dimension in the destination tensor, which
+        # triggers a rank‑mismatch assertion on Apple MPS.  
+        s_is_flat = s_is.squeeze(1)                  # (N,)
+
+        # Sum of user scores per article
+        sums   = torch.zeros(B, device=s_is.device).scatter_add_(
+                    0,              # aggregate along article dimension
+                    src_idx,        # (N,)
+                    s_is_flat       # (N,)
+                 )
+
+        # Count of engaged users per article
+        counts = torch.zeros(B, device=s_is.device).scatter_add_(
+                    0,
+                    src_idx,
+                    torch.ones_like(s_is_flat)
+                 )
+
+        # Average user score for each article
+        p_j = (sums / counts.clamp_min(1)).unsqueeze(1)   # (B, 1)
+
+        out = self.integrate_module(v_j, p_j)            # (B,1)
+        return out.squeeze(1), s_is, v_j
+        
     def get_wu(self):
         return self.score_module.get_wu()
+    
+
+class Simple_CSI_model(nn.Module):
+    def __init__(
+            self, 
+            dim_x_t, 
+            dim_embedding_wa, 
+            dim_hidden, 
+            dim_v_j,
+            dim_y_i, 
+            dim_embedding_wu
+            ):
+        super(Simple_CSI_model, self).__init__()
+        self.capture_module = CaptureModule(dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j)
+        self.integrate_module = IntegrateModule(dim_v_j, user_scores_dim=0)  # No user scores in this model
+
+    def forward(self, x_t, lengths, y_flat, src_idx):
+        v_j = self.capture_module(x_t, lengths)
+        out = self.integrate_module(v_j, None)  # Use a constant p_j of 0.5
+        return out.squeeze(1), None, v_j
+    
+
+    

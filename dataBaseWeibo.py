@@ -22,7 +22,7 @@ Usage
 """
 import rumorProject as RP
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 import math, random, gc, sys, json
 import pickle
 from collections import Counter
@@ -36,6 +36,12 @@ from tqdm.auto import tqdm
 
 from sentence_transformers import SentenceTransformer
 import torch
+
+
+# for reproducibility
+torch.manual_seed(RP.config.SEED_TORCH)  
+random.seed(RP.config.SEED_RAND)  
+np.random.seed(RP.config.SEED_NP)  
 
 
 
@@ -136,7 +142,7 @@ class WeiboDataBase:
             # Convert each list into a 1D LongTensor
             self.article_user_idxs = [torch.tensor(lst, dtype=torch.long)
                                     for lst in article_user_idxs]
-
+            del self.user_article_mask  # free memory
             # Print summary of article_user_idxs
             print(f"[Init] Built article_user_idxs for {len(self.article_user_idxs)} articles.")
             print(f"[Init] Example: article 0 has {len(self.article_user_idxs[0])} engaged users.")
@@ -347,7 +353,10 @@ class WeiboDataBase:
             vecs.append(enc)
         all_vecs = np.vstack(vecs)
 
-        del model; torch.mps.empty_cache(); gc.collect()
+        del model
+        if torch.backends.mps.is_available(): torch.mps.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        gc.collect()
         # compress 384-d ⇒ dim_x_tau with random projection
         grp = GaussianRandomProjection(
             n_components=self.dim_x_tau, 

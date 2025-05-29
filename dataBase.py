@@ -586,10 +586,24 @@ def rumor_collate(batch):
     article_feats = torch.stack([b['article_features'] for b in batch])
     lengths       = torch.tensor([b['lengths']       for b in batch], dtype=torch.long)
     labels        = torch.tensor([b['labels']        for b in batch], dtype=torch.long)
-    y_is_list     = [b['y_is'] for b in batch]  # list of (n_engaged_i, dim_y)
+
+    """in a batch the y_is aren't of the same size, so we need to flatten 
+    them and keep track of the source index for each y_is
+    """
+    y_blocks, src_index = [], []
+    for art_idx, b in enumerate(batch):
+        y_is = b['y_is']                      # (n_i, dim_y)
+        y_blocks.append(y_is)
+        src_index.append(
+            torch.full((len(y_is),), art_idx, dtype=torch.long)
+        )
+    y_flat  = torch.cat(y_blocks, 0)         # (N, dim_y)
+    src_idx = torch.cat(src_index, 0)        # (N,)
+    
     return {
-      'article_features': article_feats,
-      'lengths': lengths,
-      'labels': labels,
-      'y_is': y_is_list
+        'article_features': article_feats,
+        'lengths': lengths,
+        'labels': labels,
+        'y_flat': y_flat,  # (N, dim_y)
+        'src_idx': src_idx   # (N,)
     }

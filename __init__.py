@@ -7,6 +7,6 @@ from .dataBase import DataBase, RumorDataset
 
 from .trainer import Trainer
 
-from .model import CSI_model 
+from .model import CSI_model, Simple_CSI_model
 
 
