@@ -1,25 +1,4 @@
-# weibo_database.py
-"""
-Light-weight replica of database.py, but for the Weibo Rumdect dataset.
-
-🔹 It re-uses the loader you built in parseTest.py – so import order matters:
-    1. parseTest.py runs, builds `df`, `events`, `threads_source` …
-    2. We import those objects here and convert them to the structures
-       the original DataBase class expected.
-
-🔹 Main public attributes after instantiation
-    ├─ self.threads_seq        dict[thread_id] -> list of time-binned dicts
-    ├─ self.labels             dict[thread_id] -> 0/1
-    ├─ self.user_vecs_global   dict[user_id]   -> np.ndarray(dim_x_u,)
-    ├─ self.user_vecs_source   dict[user_id]   -> np.ndarray(dim_y_i,)
-    └─ self.T                  max sequence length (for padding)
-
-Usage
-------
->>> from weibo_database import WeiboDataBase
->>> data = WeiboDataBase(bin_size=1, dim_x_u=20, dim_y_i=50, dim_x_tau=100)
->>> X_seq, label = data.article_sequence('1')   # example
-"""
+#for weibo dataset
 import rumorProject as RP
 from pathlib import Path
 from collections import Counter
@@ -45,10 +24,19 @@ np.random.seed(RP.config.SEED_NP)
 
 
 
-# ----------------------------------------------------------------------
-# main class
-# ----------------------------------------------------------------------
 class WeiboDataBase:
+    """
+
+    loader + pre-processor for the Weibo dataset,
+    producing CSI-ready tensors (normalizaiton non included)
+
+    ex of use:
+        data = 
+
+        Notes:
+        tweet = a source tweet OR a reaction
+        thread = a source tweet AND all its reactions = article in CSI
+    """
     def __init__(
             self,
             bin_size: int = 1,
@@ -61,49 +49,52 @@ class WeiboDataBase:
             save_precomputed_file_name: str = None,
             device: torch.device = None
     ):
-        self.bin_size   = bin_size
-        self.dim_x_u    = dim_x_u
-        self.dim_y_i    = dim_y_i
-        self.dim_x_tau  = dim_x_tau
+        self.bin_size = bin_size
+        self.dim_x_u = dim_x_u
+        self.dim_y_i = dim_y_i
+        self.dim_x_tau = dim_x_tau
         self.event_fraction = event_fraction
         self.frac = event_fraction
         self.save_df_file_name = save_df_file_name
         self.max_seq_len = max_seq_len
         self.save_precomputed_file_name = save_precomputed_file_name
+        self.database_name = "Weibo"
 
         df_base = save_df_file_name if save_df_file_name else "weibo_df"
         self.save_df_path = Path(RP.config.DATA_EXT_DIR) / f"{df_base}.pkl"
-        pre_base = save_precomputed_file_name if save_precomputed_file_name else "weibo_precomputed"
-        self.precomputed_data_path = Path(RP.config.DATA_EXT_DIR) / f"{pre_base}.pkl"
+        if save_precomputed_file_name:
+            pre_base = save_precomputed_file_name 
+        else: pre_base =  "weibo_precomputed"
+        self.precomputed_data_path = Path(RP.config.DATA_EXT_DIR) \
+                                        / f"{pre_base}.pkl"
 
-        # placeholders
         self.tweets_df = None
-        self.threads_source   = {}
-        self.threads_seq      = {}
-        self.labels           = {}
-        self.user_vecs_global = {}
-        self.user_vecs_source = {}
+        self.threads_source = {}  #dict with key = thread_id and value = dict with source_id, user_id, time, label
+        self.threads_seq = {}  #dict with key = thread_id and value = list of dict with x_u, x_tau, delta_t, eta as keys
+        self.labels = {} #dict with key = thread_id and value = label (0 or 1 for rumor or non-rumor)
+        self.user_vecs_global = {}  #dict with key = user_id and value = vector of the user,
+        #user vector for score using weighted user graph
+        self.user_vecs_source = {} #dict with key = user_id and value = vector of the user
         self.user_article_mask = None
         self.article_user_idxs = None
-        self.T                = 0
+        self.T = None
         self.device = device
-        random.seed(RP.config.SEED_RAND)
 
         self.initialize_data()
 
     def initialize_data(self):
-        # DataFrame + events cache
+        # DataFrame + events cache, load or create them
 
         if self.precomputed_data_path.exists():
             print("Loading precomputed data")
             with open(self.precomputed_data_path, "rb") as f:
                 d = pickle.load(f)
-            self.threads_seq       = d["threads_seq"]
-            self.labels            = d["labels"]
-            self.user_vecs_global  = d["user_vecs_global"]
-            self.user_vecs_source  = d["user_vecs_source"]
+            self.threads_seq = d["threads_seq"]
+            self.labels = d["labels"]
+            self.user_vecs_global = d["user_vecs_global"]
+            self.user_vecs_source = d["user_vecs_source"]
             self.user_article_mask = d["user_article_mask"]
-            self.threads_source    = d["threads_source"]
+            self.threads_source = d["threads_source"]
             self.T = max(len(seq) for seq in self.threads_seq.values())
             print("Data loaded")
             print(f"Precomputed cache: {len(self.threads_seq)} threads; "
@@ -111,30 +102,22 @@ class WeiboDataBase:
                   f"source vectors for {len(self.user_vecs_source)} users; "
                   f"max sequence length {self.T}")
 
-            """print("re_get tweets_df")
-            with open(self.save_df_path, "rb") as f:
-                d = pickle.load(f)
-            self.tweets_df, _ = d
 
-            print("recreate user-article mask")
-            self.create_user_article_mask()
-            print("restore user-article mask")
-            self.save_precomputed_data()"""
 
-            # Build per-article user-index lists for subset-only scoring
-                # coalesce(): merge duplicate entries and finalize the sparse tensor
+            #build per-article user-index lists for subset-only scoring
+            #coalesce(): merge duplicate entries and finalize the sparse tensor
             mask = self.user_article_mask.coalesce()
             # Print basic info about the sparse mask
             print(f"[Init] user_article_mask shape: {self.user_article_mask.shape}, "
                 f"non-zero entries: {mask._nnz()}")
 
-            # Determine number of articles for correct sizing
+            #number of articles for correct sizing
             n_articles = self.user_article_mask.size(0)
 
-            # indices(): returns a 2×nnz LongTensor; row0=article_idx, row1=user_idx for each engagement
+            #indices(): returns a 2×nnz LongTensor row0=article_idx, row1=user_idx for each engagement
             thread_idxs, user_idxs = mask.indices()
 
-            # Prepare: a Python list where each element is the list of engaged user indices for that article
+            #Prepare: a Python list where each element is the list of engaged user indices for that article
             article_user_idxs = [[] for _ in range(n_articles)]
             for t, u in zip(thread_idxs.tolist(), user_idxs.tolist()):#iterate at the 2 list
                 article_user_idxs[t].append(u)
@@ -144,16 +127,21 @@ class WeiboDataBase:
                                     for lst in article_user_idxs]
             del self.user_article_mask  # free memory
             # Print summary of article_user_idxs
-            print(f"[Init] Built article_user_idxs for {len(self.article_user_idxs)} articles.")
-            print(f"[Init] Example: article 0 has {len(self.article_user_idxs[0])} engaged users.")
-                # Done: we already have everything from precomputed cache
+            print(f"Built article_user_idxs for {len(self.article_user_idxs)} articles.")
+            print(f"Example: article 0 has {len(self.article_user_idxs[0])} engaged users.")
+                #we already have everything from precomputed cache
             return
         else:
             print("Parse all threads")
-            self.tweets_df, self.threads_source = self._parse_all_threads(event_fraction=self.event_fraction)
+            self.tweets_df, self.threads_source = self._parse_all_threads(
+                event_fraction=self.event_fraction
+            )
             print("Caching parsed DataFrame")
-            print(f"DataFrame parsed: {self.tweets_df.shape}, events: {len(self.threads_source)}")
+            print(f"DataFrame parsed: {self.tweets_df.shape}")
+            print(f"number of events: {len(self.threads_source)}")
+            print(f"number of users: {self.tweets_df['user_id'].nunique()}")
             
+
             with open(self.save_df_path, "wb") as f:
                 pickle.dump((self.tweets_df, self.threads_source), f)
 
@@ -182,67 +170,46 @@ class WeiboDataBase:
             print("Data saved")
 
     def create_user_article_mask(self):
+        """
+        Create a sparse mask tensor for user-article engagements. to use it
+        in score models, to get the user indices for each article."""
         threads_ids = list(self.threads_seq.keys())
         user_ids = list(self.user_vecs_source.keys())
         thread_idx_map = {tid: idx for idx, tid in enumerate(threads_ids)}
         user_idx_map = {uid: idx for idx, uid in enumerate(user_ids)}
         
-        # dataframe with 2 colomn, thread id and user id for all tweets,
+        #dataframe with 2 colomn, thread id and user id for all tweets,
         #then remove the duplicates to get unique thread and user pairss
         pairs = self.tweets_df[['thread_id', 'user_id']].drop_duplicates()
         
-        # add 2 new colomns idXXXXX ! map will transform the thread_id and user_id to their respective indices
+        # add 2 new colomns idXXXXX ! map will transform the thread_id and user_id to their respective indexes
         pairs['thread_idx'] = pairs['thread_id'].map(thread_idx_map)
         
         pairs['user_idx'] = pairs['user_id'].map(user_idx_map)
         
-        # Drop any rows where mapping failed
+        #just in case
         pairs = pairs.dropna(subset=['thread_idx', 'user_idx'])
         thread_idxs = pairs['thread_idx'].astype(int).to_numpy()
         user_idxs = pairs['user_idx'].astype(int).to_numpy()
         
-        # Build sparse tensor
+        #build sparse tensor
         indices = torch.stack([
             torch.tensor(thread_idxs, dtype=torch.long),
             torch.tensor(user_idxs, dtype=torch.long)
         ]) # [[thread_idx1, thread_idx2, ...], [user_idx1, user_idx2, ...]] for COO matrix
         values = torch.ones(len(thread_idxs), dtype=torch.bool)
         sparse_mask = torch.sparse_coo_tensor(
-            indices, values,
-            torch.Size([len(threads_ids), len(user_ids)])
+            indices=indices, 
+            values=values,
+            size=torch.Size([len(threads_ids), len(user_ids)])
         )
         
         self.user_article_mask = sparse_mask
         return None
 
-    #to remove bc notused
-    def _extract_thread_sources(self):
-        """besoin thread_source pour build thread sequences, """
-        src_rows = self.tweets_df[self.tweets_df["parent_id"].isna()]      # root posts
-        for _, row in src_rows.iterrows():
-            tid = row["thread_id"]
-            self.threads_source[tid] = {
-                "source_id": row["tweet_id"],
-                "user_id"  : row["user_id"],
-                "time"     : int(row["ts"]),
-                "label"    : self.threads_source[tid]["label"]
-            }
-            self.labels[tid] = self.threads_source[tid]["label"]
-
-
     def _parse_all_threads(self, event_fraction: float = 0.2):
         """
-        event = thread
-        Replicates the data-loading logic that previously lived in parseTest.py.
-
-        Parameters
-        ----------
-        event_fraction : float
-            Fraction of events to load into memory (0 < x ≤ 1).  A smaller
-            value speeds up experimentation on limited hardware.
-
-        Returns
-        -------
+        parser specific to the Weibo dataset found on dropbox, loading posts and metadata 
         df : pd.DataFrame
             DataFrame with one row per post plus an 'event_id' column.
         events : dict
@@ -252,9 +219,7 @@ class WeiboDataBase:
         DATA_ROOT   = Path(RP.config.DATA_EXT_DIR) / 'weibo_dataset'
         LABEL_FILE  = DATA_ROOT / 'Weibo.txt'
         if not LABEL_FILE.exists():
-            sys.exit(f'ERROR: {LABEL_FILE} not found ‒ make sure “rumdect” is extracted next to {Path(__file__).name}')
-
-
+            sys.exit(f'ERROR: {LABEL_FILE} not found - make sure “rumdect” is extracted next to {Path(__file__).name}')
 
         events = {}
         with open(LABEL_FILE, encoding='utf-8') as f:
@@ -287,7 +252,7 @@ class WeiboDataBase:
         else:
             print(f"Found {len(events)} events in metadata file.")
 
-        # Sample a fraction of events for quick experiments
+        #sample a fraction of events for quick experiments
         if 0 < event_fraction < 1:
             n_events = max(1, math.ceil(len(events) * event_fraction))
             n_events = min(n_events, len(events))
@@ -325,7 +290,7 @@ class WeiboDataBase:
 
         print(f"Keeping columns: {df.columns.tolist()}")
 
-        # summary stats
+        #summary stats
         label_dist = Counter(events[eid]['label'] for eid in selected_event_ids)
         print(f"Label distribution (0 = non‑rumor, 1 = rumor): {dict(label_dist)}")
         print("DataFrame head:\n", df.head())
@@ -334,15 +299,17 @@ class WeiboDataBase:
         return df, {eid: events[eid] for eid in selected_event_ids}
 
 
-
-
     def _precompute_embeddings(self, batch_size=256):
+        """Embed every tweet text once and add the 384 dim vector
+         to the new colomn embed with tweets_df['embed']."""
+        #load the model
         model  = SentenceTransformer(
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
         ).to(self.device)
+        #list of all the weibo poqt text
         texts  = self.tweets_df["text"].fillna("").tolist()
         batches = range(0, len(texts), batch_size)
-        vecs = []
+        vecs = []#each elem will be an array of size batch_size with each element a vector of dim 384
         for i in tqdm(batches, desc="Embedding Weibo posts"):
             enc = model.encode(
                 texts[i:i+batch_size],
@@ -351,6 +318,7 @@ class WeiboDataBase:
                 device=self.device
             )
             vecs.append(enc)
+        #flat everything to have a single 2D array
         all_vecs = np.vstack(vecs)
 
         del model
@@ -358,6 +326,11 @@ class WeiboDataBase:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
         # compress 384-d ⇒ dim_x_tau with random projection
+        #based on johnson lindenstrauss lemme
+        """wiki:The lemma states that a set of points in a high-dimensional space can
+        be embedded into a space of much lower dimension in such a way that distances
+        between the points are nearly preserved. In the classical proof of the lemma,
+        the embedding is a random (Normal dist) orthogonal projection. """
         grp = GaussianRandomProjection(
             n_components=self.dim_x_tau, 
             random_state=RP.config.SEED_RAND
@@ -373,9 +346,13 @@ class WeiboDataBase:
 
     def _build_threads_sequences(self):
         seq_lengths = []
+        #get source time , select the tweet associated to the thread_id
+        #and sort them by time
         for tid, grp in self.tweets_df.groupby("thread_id"):
             src_time = self.threads_source[tid]["time"]
+             #grp.ts is the colomns of time of the tweets
             grp_sorted = grp.sort_values("ts")
+            #bin_df is just a table of the tweet of a given thread in order of bin, subdivised in bins
             bins = ((grp_sorted["ts"] - src_time) // (self.bin_size*3600)).astype(int)
 
             seq = []
@@ -383,9 +360,10 @@ class WeiboDataBase:
             for bin_idx, bin_df in grp_sorted.groupby(bins):
                 eta = len(bin_df)
                 delta_t = 0 if last_non_empty is None else bin_idx - last_non_empty
-                last_non_empty = bin_idx
+                last_non_empty = bin_idx #ensure delta t is the time between the last non empty bin and the current one
 
-                # aggregate embeddings and user vectors
+                #aggregate embeddings and user vectors
+                #do a mean like in the paper
                 x_tau = np.mean(np.vstack(bin_df["embed"]), axis=0)
                 user_vecs = [self.user_vecs_global[u] for u in bin_df["user_id"]]
                 x_u = np.mean(user_vecs, axis=0) if user_vecs else np.zeros(self.dim_x_u)
@@ -401,16 +379,18 @@ class WeiboDataBase:
             seq_lengths.append(len(seq))
 
         self.T = max(seq_lengths)
-        print(f"threads_seq built: {len(self.threads_seq)} threads; max sequence length {self.T}")
+        print(f"threads_seq built: {len(self.threads_seq)} threads, max sequence length {self.T}")
 
-
+    #ajout d'antoine pour y acceder depuis trainer
     def article_ids(self):
         return list(self.threads_seq.keys())
 
     def article_sequence(self, art_id):
+        """Return (X_seq:list[dict], label:int)"""
         return self.threads_seq[art_id], self.labels[art_id]
 
     def user_feature_matrix(self):
+        """Return (list[user_id], np.ndarray[num_users, user_k])"""
         print("Getting user feature matrix")
         ids = list(self.user_vecs_source.keys())
         mat = np.vstack([self.user_vecs_source[u] for u in ids])

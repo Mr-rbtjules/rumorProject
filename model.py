@@ -68,15 +68,20 @@ class ScoreModule(nn.Module):
 
 
 class IntegrateModule(nn.Module):
-    def __init__(self, dim_v_j, user_scores_dim=1):
+    def __init__(self, dim_v_j, user_scores_dim=1, alpha=1):
         super(IntegrateModule, self).__init__()
+        self.alpha = alpha # learnable scale for user score
         self.fc = nn.Linear(dim_v_j + user_scores_dim, 1)
-    
+
     def forward(self, v_j, p_j):
-        # Compute per-article average user score over the engaged subset
-        if p_j is None:
-            c_j = v_j  # If no user scores, use only article features
-        else:
+        """
+        v_j : Tensor of shape (B, dim_v_j)
+        p_j : Tensor of shape (B, 1) or None
+        """
+        if p_j is None:            # simple‑CSI branch (no user scores)
+            c_j = v_j
+        else:                      # scale the average user score to avoid tiny gradients
+            p_j = self.alpha * p_j
             c_j = torch.cat((v_j, p_j), dim=1)
         return torch.sigmoid(self.fc(c_j))
 
@@ -89,12 +94,13 @@ class CSI_model(nn.Module):
             dim_hidden, 
             dim_v_j,
             dim_y_i, 
-            dim_embedding_wu
+            dim_embedding_wu,
+            alpha=1
             ):
         super(CSI_model, self).__init__()
         self.capture_module = CaptureModule(dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j)
         self.score_module = ScoreModule(dim_y_i, dim_embedding_wu)
-        self.integrate_module = IntegrateModule(dim_v_j)
+        self.integrate_module = IntegrateModule(dim_v_j, alpha=alpha)
     """
        #y_is and s_is instead of y_i and s_i because for all enguaged users (no mask)
     def forward(self, x_t, lengths, y_is):
