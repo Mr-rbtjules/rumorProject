@@ -11,18 +11,18 @@ class CaptureModule(nn.Module):
     def __init__(self, dim_x_t, dim_embedding_wa, dim_hidden, dim_v_j):
         super(CaptureModule, self).__init__()
         self.embedding_wa = nn.Linear(dim_x_t, dim_embedding_wa)
-        self.ln1 = nn.LayerNorm(dim_embedding_wa)  # Replace BatchNorm with LayerNorm
+        self.ln1 = nn.LayerNorm(dim_embedding_wa)
         self.dropout_wa = nn.Dropout(p=0.2)
         self.rnn = nn.LSTM(dim_embedding_wa, dim_hidden, batch_first=True)
-        self.ln2 = nn.LayerNorm(dim_hidden)  # Replace BatchNorm with LayerNorm
+        self.ln2 = nn.LayerNorm(dim_hidden)
         self.fc_wr = nn.Linear(dim_hidden, dim_v_j)
         self.dropout_wr = nn.Dropout(p=0.2)
 
-    def forward(self, x_t, lengths):  # xt = (η, ∆t, xu , xτ) are the features of the article
+    def forward(self, x_t, lengths):
         batch_size, seq_len, feat_dim = x_t.size()
 
         #process everything in the batch
-        flat = x_t.view(-1, feat_dim) # the batch aren't sperated in different dimension, they just follow each other
+        flat = x_t.view(-1, feat_dim)
         emb_flat = self.embedding_wa(flat) 
         emb_flat = self.ln1(emb_flat)
         emb_flat = torch.tanh(emb_flat)
@@ -42,7 +42,7 @@ class CaptureModule(nn.Module):
         # Apply LayerNorm before final linear layer
         h_T = self.ln2(h_T)
         h_T = self.dropout_wr(h_T)
-        v_j = torch.tanh(self.fc_wr(h_T))  # removed tanh for identity
+        v_j = torch.tanh(self.fc_wr(h_T))
         return v_j
 
 
@@ -51,14 +51,14 @@ class ScoreModule(nn.Module):
         super(ScoreModule, self).__init__()
         #register buffer move with the model and not trained and saved with the model
         self.user_fc = nn.Linear(dim_y_i, dim_embedding_wu)
-        self.ln = nn.LayerNorm(dim_embedding_wu)  # Replace BatchNorm with LayerNorm
+        self.ln = nn.LayerNorm(dim_embedding_wu)
         self.score_fc = nn.Linear(dim_embedding_wu, 1)
         
         # we put y_is instead of y_i bc element in the batch is composed
         #  of multiple y_i  corresponding to the engaged users
     def forward(self, y_is): 
         h = self.user_fc(y_is)
-        h = self.ln(h)  # Apply LayerNorm
+        h = self.ln(h)
         y_i_ts = torch.tanh(h)
         s_is = torch.sigmoid(self.score_fc(y_i_ts))
         return s_is, y_i_ts
@@ -122,9 +122,6 @@ class CSI_model(nn.Module):
         # Compute the scores for every engaged user
         s_is, _ = self.score_module(y_flat)          # (N, 1)
 
-        # --- robust aggregation ---  
-        # Avoid a trailing singleton dimension in the destination tensor, which
-        # triggers a rank‑mismatch assertion on Apple MPS.  
         s_is_flat = s_is.squeeze(1)                  # (N,)
 
         # Sum of user scores per article
@@ -134,14 +131,14 @@ class CSI_model(nn.Module):
                     s_is_flat       # (N,)
                  )
 
-        # Count of engaged users per article
+        #Count of engaged users per article
         counts = torch.zeros(B, device=s_is.device).scatter_add_(
                     0,
                     src_idx,
                     torch.ones_like(s_is_flat)
                  )
 
-        # Average user score for each article
+        # average user score for each article
         p_j = (sums / counts.clamp_min(1)).unsqueeze(1)   # (B, 1)
 
         out = self.integrate_module(v_j, p_j)            # (B,1)
@@ -167,7 +164,7 @@ class Simple_CSI_model(nn.Module):
 
     def forward(self, x_t, lengths, y_flat, src_idx):
         v_j = self.capture_module(x_t, lengths)
-        out = self.integrate_module(v_j, None)  # Use a constant p_j of 0.5
+        out = self.integrate_module(v_j, None)
         return out.squeeze(1), None, v_j
     
 
